@@ -1,0 +1,51 @@
+# Horizontal autoscaling for the web tier only.
+#
+# Why only `backend`: it is the one component whose load is proportional to
+# request rate.  Workers scale with queue depth (Part 5 can drive that from an
+# external metric), nginx is nearly free, and the scheduler must never be
+# scaled at all.
+#
+# Requires a metrics source: metrics-server (resource metrics) is what this
+# demo uses.  Without it the HPA is created but reports
+# `<unknown>` and never scales - `kubectl describe hpa` shows
+# "unable to fetch metrics from resource metrics API".
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend
+  labels:
+    app: backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+          # Utilization is measured against the *request* (100m), not the limit.
+          # With request=100m a pod at 70m of CPU is already at 70% and triggers
+          # a scale-up, even though it is nowhere near its 1-core limit: set the
+          # request to the value you actually want to be scaled against.
+  behavior:
+    # Asymmetric: react fast to load, react slowly to a lull.  Scaling in a
+    # gunicorn pod discards its warm Python/asset caches, and Frappe's request
+    # cost is dominated by first-touch imports.
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

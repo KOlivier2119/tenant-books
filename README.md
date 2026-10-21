@@ -70,6 +70,51 @@ Image facts, all measured (details and commands in `docs/part2-docker.md` §9):
 | the whole Part 1 flow still works from the image | REST `create_order` -> `TB-ORD-2026-0001` / `TB-INV-2026-00001`; worker-long `Job OK` for `tenantbooks-pdf-…` and `tenantbooks-webhook-…`; receiver logged `ACCEPTED invoice.submitted`; delivery log `Sent / attempts 1 / 200`; `/files/TB-INV-2026-00001.pdf` -> 200 `application/pdf` 16,917 B |
 | prod refuses to run tests | `bench run-tests` -> "You can enable tests by ... set-config allow_tests true" |
 
+## Part 3 status: Kubernetes (manifests verified on k3s; app tier pending one root command)
+
+```
+k8s/base/kustomization.yaml     # 37 objects, one apply
+k8s/base/configmap.yaml         # non-secret env for all 7 frappe roles
+k8s/base/secret.example.yaml    # -> secret.yaml (git-ignored; kustomize fails without it)
+k8s/base/pvc.yaml               # sites + logs, the shared Frappe filesystem
+k8s/base/mariadb.yaml           # headless Service + StatefulSet (or delete for an external DB)
+k8s/base/redis.yaml             # redis-cache (Deployment) + redis-queue (StatefulSet, AOF)
+k8s/base/jobs.yaml              # create-site, migrate  (+ the PVC-seeding initContainer)
+k8s/base/{backend,frontend,websocket,scheduler,workers}.yaml   # the 7 roles, 1 image
+k8s/base/hpa.yaml               # autoscaling/v2, CPU 70%, 2-6 replicas, asymmetric behavior
+k8s/base/networkpolicy.yaml     # default-deny + 10 allows (both directions, see docs)
+k8s/base/ingress.yaml           # traefik now, cert-manager TLS block commented
+k8s/tls/issuer.yaml             # ClusterIssuers, kept out of base on purpose
+k8s/overlay-registry/           # same manifests, image from ghcr.io (the CI path)
+```
+
+```bash
+cp k8s/base/secret.example.yaml k8s/base/secret.yaml    # 3 values; kustomize refuses without it
+kubectl apply -f k8s/base/namespace.yaml                # Namespace first (see docs §2)
+kubectl apply -k k8s/base
+kubectl -n tenantbooks wait --for=condition=Complete --timeout=15m job/create-site
+```
+
+Measured on this machine (k3s 1.36.5, single node, full transcript in
+[docs/part3-kubernetes.md](docs/part3-kubernetes.md)):
+
+| Claim | Evidence |
+| --- | --- |
+| every manifest is schema- and admission-valid | `kubectl kustomize k8s/base` -> 37 docs; `kubectl apply -k k8s/base --dry-run=server` -> 37 x `created (server dry run)`, zero errors |
+| the data tier really runs | `db-0 1/1`, `redis-cache 1/1`, `redis-queue-0 1/1` with exec/tcpSocket probes passing |
+| non-root can write the shared volume | probe pod with `runAsUser: 1000, runAsGroup: 0, fsGroup: 0`: `drwxrwsrwx /sites`, `WRITE_OK` |
+| NetworkPolicy blocks, not just parses | `tier=frappe` pod: `db (10.42.0.18:3306) open` in 0.2 s; unlabelled pod: no response (dropped) on `db`, `redis-cache`, `redis-queue` |
+| HPA accepted with its behavior section | `describe hpa backend` echoes 30 s/300 s windows and `0 current / 0 desired` |
+| the image is the only missing piece for the app tier | k3s runs its own containerd: `docker save -o /tmp/tenantbooks.tar` done (692 MB); `sudo k3s ctr images import /tmp/tenantbooks.tar` needs root |
+
+Four real bugs were caught by running the manifests rather than writing them (docs §15):
+a Kubernetes PVC is **not** pre-populated from the image the way a Docker named volume is
+(so `apps.txt` and `/sites/assets` were missing -> seeding initContainer); a NetworkPolicy
+egress allow with no matching ingress allow is a silent timeout; `mysqladmin` does not
+exist in `mariadb:11.4` so the DB probe died on `command not found`; and a headless
+Service publishes no DNS record while its pod is NotReady, which makes a broken probe look
+like a DNS failure from every client.
+
 ## Quickstart (verified on Docker 29, Fedora 44)
 
 ```bash
@@ -174,6 +219,27 @@ docker compose -f docker/compose.local.yaml exec backend \
     header** sees 404, because Frappe resolves the site per request - the
     container looks unhealthy while serving traffic fine. Same trap in
     Kubernetes: `httpGet` probes need `httpHeaders: [{name: Host, ...}]`.
+12. (Part 3) **a Kubernetes PVC is born empty.** A Docker named volume copies the
+    image's content at that path on first use, which is how the compose stack got
+    `sites/apps.txt` and the built `sites/assets` for free. On the cluster every pod
+    failed on a hidden `sites/` until `jobs.yaml` grew a `seed-sites-volume`
+    initContainer that mounts the PVC at a *different* path and copies once.
+13. (Part 3) a NetworkPolicy **egress** allow with no **ingress** allow on the
+    target is a silent timeout: `default-deny` is evaluated per pod per direction,
+    so my first version blocked every client from MariaDB and Redis while looking
+    correct. The `db-ingress` / `redis-ingress` / `receiver-ingress` documents exist
+    because of that bug, not for symmetry.
+14. (Part 3) `mysqladmin` is **not in `mariadb:11.4`** (the image ships
+    `/usr/sbin/mariadbd` plus the renamed `mariadb` / `mariadb-admin` clients), so the
+    DB startup probe died with `command not found` and left the pod
+    Running-but-Never-Ready. Our app image *does* have `/usr/bin/mysqladmin`, so the
+    two `wait-for-db` initContainers are fine - two images, both "MariaDB", different
+    tools.
+15. (Part 3) a **headless Service publishes DNS only for Ready endpoints**: while
+    `db-0` failed its probe, every client saw `nc: bad address 'db'`, i.e. a storage-
+    looking error for a probe problem. Related: a StatefulSet whose new template fails
+    its probe deadlocks the rollout (`Waiting for 1 pods to be ready` forever) until
+    `kubectl delete pod db-0`.
 
 ## Not verified yet
 
@@ -199,3 +265,12 @@ docker compose -f docker/compose.local.yaml exec backend \
 - (Part 2) **arbitrary uid at runtime**: the image is group-0 writable so a
   kubelet-assigned uid *should* work, but only uid 1000 was actually exercised
   here; `runAsUser`/`fsGroup` are tested in Part 3.
+- (Part 3) **the seven app pods on the cluster.** Manifests are accepted by the real
+  API server and the data tier runs, but k3s has its own containerd and importing the
+  local image needs root: `sudo k3s ctr images import /tmp/tenantbooks.tar` (the tar is
+  already saved, 692 MB). After that one command the remaining verification is listed in
+  `docs/part3-kubernetes.md` §13.
+- (Part 3) **cert-manager TLS**: the `tls:` block and `k8s/tls/issuer.yaml` are written
+  but no certificate was issued here - HTTP-01 needs a publicly resolvable hostname.
+- (Part 3) **multi-node / RWX storage** and **HPA actually scaling**: both reasoned
+  about, neither observed (one node, one RWO provisioner, no backend pods running).

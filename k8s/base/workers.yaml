@@ -1,0 +1,116 @@
+# Background job workers.  `bench worker --queue <names>` consumes from
+# redis-queue; a job is only picked up by a worker that lists its queue, so
+# queue names are routing, not labels.
+#
+# Why two Deployments instead of one with more replicas:
+#   short,default - user-facing and fast (notification emails, small updates).
+#                   Backlog here is visible to a human within seconds.
+#   long          - PDF rendering (spawns wkhtmltopdf, 1-3 s CPU each) and the
+#                   webhook delivery.  Slow, and it can hold memory.
+# Scaling them independently is the entire reason Frappe has queue names: one
+# slow PDF flood must never delay a login email.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-short
+  labels:
+    app: worker-short
+    tier: frappe
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: worker-short
+  template:
+    metadata:
+      labels:
+        app: worker-short
+        tier: frappe
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 0
+      containers:
+        - name: worker
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          command: ["bench", "worker", "--queue", "short,default"]
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+          resources:
+            requests:
+              cpu: 100m
+              memory: 300Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+      # No probes: see the reasoning in scheduler.yaml.  The signal that a
+      # worker is unhealthy is queue backlog / job age (Part 5 alert), not
+      # "is the process alive".
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: logs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-long
+  labels:
+    app: worker-long
+    tier: frappe
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: worker-long
+  template:
+    metadata:
+      labels:
+        app: worker-long
+        tier: frappe
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 0
+      containers:
+        - name: worker
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          command: ["bench", "worker", "--queue", "long"]
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+          resources:
+            requests:
+              # wkhtmltopdf is a child process of this container, so its CPU and
+              # memory come out of this limit too - the highest limit in the
+              # stack after the database.
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: logs

@@ -1,0 +1,82 @@
+# Demo-only: the HMAC-receiving endpoint from mock-receiver/, so webhook
+# delivery can be verified end to end inside the cluster.  A real deployment has
+# no such pod - the receiver is the partner's system, reached over the public
+# internet (which is why networkpolicy.yaml also shows the outbound-443 rule).
+#
+# Image built once, locally - docker/compose.prod.yaml pins the name so that
+# compose and Kubernetes agree on it:
+#   docker compose --env-file docker/prod.env -f docker/compose.prod.yaml build mock-receiver
+#   # -> tenantbooks-mock-receiver:v15.103.0
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-receiver
+  labels:
+    app: mock-receiver
+spec:
+  selector:
+    app: mock-receiver
+  ports:
+    - name: http
+      port: 8071
+      targetPort: 8071
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-receiver
+  labels:
+    app: mock-receiver
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: mock-receiver
+  template:
+    metadata:
+      labels:
+        app: mock-receiver
+    spec:
+      containers:
+        - name: receiver
+          image: tenantbooks-mock-receiver:local
+          imagePullPolicy: IfNotPresent
+          # The image bakes receiver.py in and runs it as a non-root user; no
+          # command override is needed here.
+          env:
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: tenantbooks-secrets
+                  key: WEBHOOK_SECRET
+            - name: PORT
+              value: "8071"
+          ports:
+            - name: http
+              containerPort: 8071
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          # receiver.py answers GET on any path with {"status":"ok"} - that is
+          # the probe endpoint; POST /hook is the delivery endpoint.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8071
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8071
+            initialDelaySeconds: 5
+            periodSeconds: 20

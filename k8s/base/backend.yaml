@@ -1,0 +1,127 @@
+# The web tier: nginx in front, gunicorn behind.  `backend` is the gunicorn
+# process (the image's default CMD), `frontend` is nginx serving static assets
+# and proxying.  Split because they scale on different axes: gunicorn costs
+# Python memory per worker, nginx costs almost nothing.
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  labels:
+    app: backend
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels:
+    app: backend
+    tier: frappe
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    # maxUnavailable: 0 => during an upgrade the old pod is only torn down after
+    # a new one is Ready, so there is never a moment with fewer serving pods
+    # than the replica count.  Requires maxSurge >= 1 (extra headroom on the
+    # node) - see docs/part3-kubernetes.md "Rollout and rollback".
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+        tier: frappe
+    spec:
+      securityContext:
+        runAsUser: 1000 # "frappe" in the image
+        runAsGroup: 0 # group 0, matching the chmod -R g=u in the Containerfile
+        fsGroup: 0 # makes the mounted PVCs group-0 writable for uid 1000
+        # No runAsNonRoot needed: the image already sets USER frappe, but the
+        # explicit uid means a future image that forgot it fails here loudly
+        # instead of quietly running as root.
+      terminationGracePeriodSeconds: 45
+      # gunicorn gets SIGTERM and finishes in-flight requests; 45s > the 30s
+      # nginx upstream timeout, so nginx never holds a connection we are
+      # already closing.
+      containers:
+        - name: backend
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          # no command: the image CMD (docker/custom/start.sh) runs gunicorn with
+          # exec, so gunicorn is PID 1 and receives the SIGTERM above.
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+            # Deliberately NOT the Secret: request handlers read the per-site
+            # site_config.json inside the PVC, which already contains the *site's*
+            # low-privilege DB user.  Handing every web pod the root DB password
+            # would widen the blast radius of one compromised pod for nothing.
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 400Mi
+            limits:
+              # No CPU limit (throttling turns into latency spikes under
+              # load).  The memory limit is the ceiling that protects the node,
+              # and GUNICORN_MAX_REQUESTS recycles workers before they reach it.
+              cpu: "1"
+              memory: 1Gi
+          # Frappe picks the site from the Host header, so a probe against the
+          # bare pod IP returns 404 even on a perfectly healthy gunicorn.  This
+          # literal must equal SITE_NAME in configmap.yaml; Kubernetes does not
+          # expand $(SITE_NAME) inside probe fields, which is why it is repeated.
+          startupProbe:
+            httpGet:
+              path: /api/method/ping
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: tenantbooks.localhost
+            periodSeconds: 5
+            failureThreshold: 60 # 5 min of cold start (bench imports ~40s)
+          readinessProbe:
+            httpGet:
+              path: /api/method/ping
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: tenantbooks.localhost
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/method/ping
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: tenantbooks.localhost
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: logs

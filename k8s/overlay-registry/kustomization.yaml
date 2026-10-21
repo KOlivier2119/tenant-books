@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Same manifests, image pulled from a registry instead of the node's own image
+# store.  This is what CI deploys in Part 4.
+#
+#   kubectl apply -k k8s/overlay-registry
+#   kubectl -n tenantbooks set image deployment/backend \
+#     backend=ghcr.io/kolivier2119/tenantbooks:<git-sha> --record=false
+#
+# The `images:` block below rewrites the name *inside* the base manifests at
+# build time, so backend/frontend/workers/scheduler all change together and no
+# file needs a per-environment copy.
+resources:
+  - ../base
+
+images:
+  - name: tenantbooks
+    # `name` matches the image as written in the base manifests; the
+    # tag/digest pair used in production is the git SHA of the commit that was
+    # built (Part 4), never a moving tag like :latest or :main - a rollout must
+    # be reproducible, and `kubectl rollout undo` only means something if the
+    # previous pod spec pointed at an image that still exists unchanged.
+    newName: ghcr.io/kolivier2119/tenantbooks
+    newTag: v15.103.0
+    # digest: sha256:...   # pin the digest to make the tag immutable as well
+
+  - name: tenantbooks-mock-receiver
+    newName: ghcr.io/kolivier2119/tenantbooks-mock-receiver
+    newTag: v15.103.0

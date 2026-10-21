@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sites
+  labels:
+    app: tenantbooks-sites
+spec:
+  # ReadWriteMany is what this design actually wants: the web pods, the workers
+  # and the scheduler all read and write the same tree (uploaded files under
+  # {site}/private/files, generated PDFs, logs).  On a MULTI-node cluster an
+  # RWO volume cannot be attached to pods on different nodes at the same time,
+  # and the second pod sits in Pending with
+  #   "multi-attach error" / "volume already attached to node X".
+  # It is RWO here because the laptop cluster is a single node and its
+  # `local-path` provisioner only offers RWO - one node means "one attach" is
+  # satisfied, so every pod shares the same host directory.
+  #
+  # For a real multi-node cluster, install an RWX storage class (NFS:
+  #   kubectl storageClass: nfs-client  |  longhorn | cephfs | EFS) and change
+  # exactly one line:
+  #   accessModes: [ReadWriteMany]
+  # No other manifest changes; the PVC name and mount paths stay the same.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: logs
+  labels:
+    app: tenantbooks-sites
+spec:
+  # Worker/scheduler/gunicorn write their tracebacks here; `bench --site ...
+  # show-logs` reads them.  Same single-node caveat as above.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi

@@ -1,0 +1,118 @@
+# MariaDB as a StatefulSet (single replica), i.e. the demo runs its own
+# database.  For production, prefer a managed/Ha database and DELETE both files
+# below, then point the ConfigMap at it:
+#
+#   DB_HOST: <external host>     DB_PORT: "3306"
+#   secret.yaml: DB_ROOT_PASSWORD -> the admin user that may CREATE DATABASE
+#
+# A StatefulSet (not a Deployment) because the database needs (a) a stable
+# network name that survives pod restarts and (b) a volume that is re-attached
+# to the *same* pod identity rather than created fresh by a ReplicaSet.
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  labels:
+    app: mariadb
+spec:
+  # Headless: no kube-proxy load balancing, DNS returns the pod IP directly.
+  # Correct for one database - a ClusterIP in front of a single writer adds a
+  # hop and hides which pod you are actually talking to during debugging.
+  clusterIP: None
+  selector:
+    app: mariadb
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+  labels:
+    app: mariadb
+spec:
+  serviceName: db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mariadb
+  template:
+    metadata:
+      labels:
+        app: mariadb
+    spec:
+      securityContext:
+        # mariadb's own entrypoint starts as root to chown /var/lib/mysql, then
+        # drops to uid 999 (mysql).  Giving the whole pod group 0 lets it do the
+        # chown on a freshly provisioned volume without running the server as
+        # root.  (fsGroup only applies to volumes it can chown, see the
+        # note about local-path in docs/part3-kubernetes.md.)
+        fsGroup: 999
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: mariadb
+          image: mariadb:11.4.13
+          imagePullPolicy: IfNotPresent
+          args:
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_unicode_ci
+            - --skip-character-set-client-handshake
+            - --innodb-buffer-pool-size=128M
+            - --max-connections=300
+          env:
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tenantbooks-secrets
+                  key: DB_ROOT_PASSWORD
+          ports:
+            - name: mysql
+              containerPort: 3306
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # exec probe, not tcpSocket: a port opens before InnoDB has finished
+          # crash recovery, so "can connect" is not "can serve".
+          #
+          # mysqladmin does not exist in mariadb:11.4 (the image ships the server
+          # only, and the client binaries were renamed mariadb-*); the image's own
+          # healthcheck.sh is the tool that is guaranteed to be there.  Getting
+          # this wrong is loud but misleading: "startup probe failed: command not
+          # found" leaves the pod Running-but-Never-Ready, and the headless
+          # Service then returns NO DNS record, so every client sees
+          # "bad address 'db'" and you go debugging the wrong thing.
+          startupProbe:
+            exec:
+              command: ["/usr/local/bin/healthcheck.sh", "--connect", "--innodb_initialized"]
+            periodSeconds: 5
+            failureThreshold: 60 # 5 min for first-boot initialization
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/healthcheck.sh", "--connect", "--innodb_initialized"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/healthcheck.sh", "--connect", "--innodb_initialized"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi

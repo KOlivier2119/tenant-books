@@ -1,0 +1,88 @@
+# Socket.IO: real-time UI updates (progress bars, notifications).  Stateless
+# apart from its Redis pub/sub, so it scales like the web tier.
+apiVersion: v1
+kind: Service
+metadata:
+  name: websocket
+  labels:
+    app: websocket
+spec:
+  selector:
+    app: websocket
+  ports:
+    - name: socketio
+      port: 9000
+      targetPort: 9000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: websocket
+  labels:
+    app: websocket
+    tier: frappe
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: websocket
+  template:
+    metadata:
+      labels:
+        app: websocket
+        tier: frappe
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 0
+      containers:
+        - name: socketio
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          command:
+            [
+              "node",
+              "/home/frappe/frappe-bench/apps/frappe/socketio.js",
+            ]
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+          ports:
+            - name: socketio
+              containerPort: 9000
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          # tcpSocket, not httpGet: socket.io answers a bare GET with 400
+          # Bad Request, so an HTTP probe would kill a healthy server.
+          startupProbe:
+            tcpSocket:
+              port: 9000
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: sites

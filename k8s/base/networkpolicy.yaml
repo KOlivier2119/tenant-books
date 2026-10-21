@@ -1,0 +1,267 @@
+# NetworkPolicy in this namespace is default-deny plus explicit allows.
+#
+# DEVIATION FROM THE BRIEF, on purpose: the spec asked for "a NetworkPolicy that
+# allows only the web pods to reach MariaDB".  Taken literally that breaks the
+# application, because in Frappe *every* bench process talks to the database:
+# the workers run the ORM to render a PDF, the scheduler runs the ORM for the
+# overdue sweep, and the migrate/create-site Jobs are nothing but ORM calls.  A
+# policy that permits only the web tier would leave the site readable and every
+# background job dead.  So the allow-list here is "the frappe tier" - which is
+# still a real reduction: it excludes the mock receiver, any pod you debug with,
+# and anything in another namespace.  Tightening further requires splitting
+# `tier: frappe` per role, which is exactly what the rules below are written to
+# make easy.
+#
+# Test it yourself (full transcript in docs/part3-kubernetes.md):
+#   kubectl -n tenantbooks run labelfl --image=busybox:1.36 --restart=Never \
+#     --labels=tier=frappe --command -- sleep 3600
+#   kubectl -n tenantbooks exec labelfl -- nc -zv -w3 db 3306     # -> open
+#   kubectl -n tenantbooks run rogue  --image=busybox:1.36 --restart=Never \
+#     --labels=tier=debug --command -- sleep 3600
+#   kubectl -n tenantbooks exec rogue  -- nc -zv -w3 db 3306      # -> times out
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  # Empty podSelector = every pod in this namespace.  With both policyTypes
+  # declared and no rules, everything in and out is dropped until a more
+  # specific policy allows it.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    # Without this, "db" does not resolve and every pod fails with a DNS timeout
+    # that looks exactly like a refused connection.  kube-dns lives in
+    # kube-system; k3s runs it as coredns on the same port pair.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-frontend
+spec:
+  podSelector:
+    matchLabels:
+      tier: frappe-frontend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        # namespaceSelector: {} matches every namespace, which in k3s is what the
+        # traefik ingress controller (kube-system) and any other pod need in
+        # order to reach the proxy.  To restrict the face of the app to the
+        # controller only, replace it with
+        #   matchLabels: {kubernetes.io/metadata.name: kube-system}
+        # and confirm the port 8000 path still works (traefik proxies from its
+        # pod, not from the node).
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-to-app
+spec:
+  podSelector:
+    matchLabels:
+      tier: frappe-frontend
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: backend
+      ports:
+        - protocol: TCP
+          port: 8000
+    - to:
+        - podSelector:
+            matchLabels:
+              app: websocket
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frappe-to-db
+spec:
+  podSelector:
+    matchLabels:
+      tier: frappe
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mariadb
+      ports:
+        - protocol: TCP
+          port: 3306
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frappe-to-redis
+spec:
+  podSelector:
+    matchLabels:
+      tier: frappe
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis-cache
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis-queue
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frappe-to-frontend
+spec:
+  # Not obvious, and it is a real dependency: the long worker renders a PDF with
+  # wkhtmltopdf, which fetches /assets/* from the site URL (host_name).  Inside
+  # the cluster that URL resolves to the frontend Service, so a worker that
+  # cannot talk to nginx produces a truncated or failed PDF - the exact failure
+  # that was chased to completion in Part 1 (bug 6).
+  podSelector:
+    matchLabels:
+      tier: frappe
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              tier: frappe-frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frappe-to-webhook-receiver
+spec:
+  podSelector:
+    matchLabels:
+      tier: frappe
+  policyTypes: [Egress]
+  egress:
+    # Demo receiver, in this namespace.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mock-receiver
+      ports:
+        - protocol: TCP
+          port: 8071
+    # Production shape: the receiver is on the public internet.  `except` is the
+    # part worth noticing - it stops a compromised pod from using this rule to
+    # reach everything the cluster's own private ranges hold (metadata
+    # endpoints, other namespaces' databases).
+    # - to:
+    #     - ipBlock:
+    #         cidr: 0.0.0.0/0
+    #         except:
+    #           - 10.0.0.0/8
+    #           - 100.64.0.0/10
+    #           - 172.16.0.0/12
+    #           - 192.168.0.0/16
+    #   ports:
+    #     - protocol: TCP
+    #       port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-ingress
+spec:
+  # THE TRAP IN EVERY NETWORKPOLICY ROLLOUT: policy is evaluated independently on
+  # each pod, in each direction.  `frappe-to-db` above opens the *egress* side;
+  # without this document the connection still dies, because `default-deny` also
+  # blocks *ingress* to the database.  The symptom is a bare TCP timeout with no
+  # log line in either pod, which is how people end up debugging a working
+  # database for an hour.  Each egress allow below therefore has a matching
+  # ingress allow here.
+  podSelector:
+    matchLabels:
+      app: mariadb
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: frappe
+      ports:
+        - protocol: TCP
+          port: 3306
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+spec:
+  podSelector:
+    matchLabels:
+      # One document covers both instances: every pod that may reach either of
+      # them is in tier=frappe, so the allow-set is identical.  Keep the egress
+      # side split (cache vs queue) because the ports/behaviour differ.
+      tier: redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: frappe
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: receiver-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: mock-receiver
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: frappe
+      ports:
+        - protocol: TCP
+          port: 8071

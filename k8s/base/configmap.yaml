@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tenantbooks-env
+  labels:
+    app: tenantbooks-config
+data:
+  # --- where the data services live (Service DNS names, cluster-internal) ---
+  DB_HOST: db
+  DB_PORT: "3306"
+  REDIS_CACHE: redis-cache:6379
+  REDIS_QUEUE: redis-queue:6379
+  SOCKETIO_PORT: "9000"
+
+  # --- site identity ---
+  # Frappe resolves the tenant from the HTTP Host header, so the name that
+  # `bench new-site` writes must equal the name every pod uses at runtime and
+  # the Host header the probes / Ingress send.  One source of truth: SITE_NAME.
+  SITE_NAME: tenantbooks.localhost
+  FRAPPE_SITE_NAME_HEADER: tenantbooks.localhost
+  # Written into {site}/site_config.json by the create-site Job.  Without it
+  # every generated absolute URL (and wkhtmltopdf's PDF fetch) points at the
+  # pod IP, which nothing else in the cluster can reach.
+  FRAPPE_HOST_NAME: http://tenantbooks.localhost:8080
+  FRAPPE_WEBSERVER_PORT: "8080"
+
+  # --- non-secret site config, read by the create-site Job ---
+  WEBHOOK_URL: http://mock-receiver.tenantbooks.svc.cluster.local:8071/hook
+
+  # --- gunicorn sizing for the web tier (see docs/part3-kubernetes.md) ---
+  GUNICORN_WORKERS: "1"
+  GUNICORN_THREADS: "4"
+  GUNICORN_TIMEOUT: "120"
+  GUNICORN_MAX_REQUESTS: "5000"
+  GUNICORN_MAX_REQUEST_JITTER: "50"

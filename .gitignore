@@ -13,3 +13,6 @@ sites_backup/
 .qoder/
 # real values for docker/prod.env.example, never committed
 docker/*.env
+
+# k8s Secret values, generated from k8s/base/secret.example.yaml locally
+k8s/base/secret.yaml

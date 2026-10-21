@@ -1,0 +1,46 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The whole stack is one `kubectl apply -k k8s/base` away.  kustomize is built
+# into kubectl (v5.8.1 here), so there is nothing extra to install.
+#
+# Prerequisite, and it is deliberately a hard one: secret.yaml is git-ignored,
+# so the build below FAILS with "missing file" until you create it.
+#   cp k8s/base/secret.example.yaml k8s/base/secret.yaml   # then edit the values
+
+namespace: tenantbooks
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml # from secret.example.yaml; see .gitignore
+  - pvc.yaml
+  - mariadb.yaml
+  - redis.yaml
+  - mock-receiver.yaml
+  - jobs.yaml
+  - backend.yaml
+  - frontend.yaml
+  - websocket.yaml
+  - scheduler.yaml
+  - workers.yaml
+  - hpa.yaml
+  - networkpolicy.yaml
+  - ingress.yaml
+
+labels:
+  # includeSelectors stays false on purpose: adding a label to a Deployment's
+  # .spec.selector.matchLabels makes it immutable, so a later `kubectl apply`
+  # would fail with "selector does not match template labels" and force a
+  # delete-and-recreate of every pod.  Only metadata gets these.
+  - pairs:
+      app.kubernetes.io/name: tenantbooks
+      app.kubernetes.io/part-of: frappe
+    includeSelectors: false
+    includeTemplates: false
+
+# No `images:` retarget here: on the laptop the image comes from the local
+# container runtime (see docs/part3-kubernetes.md "Loading the image"), and a
+# ghcr.io reference would make the demo fail with ImagePullBackOff.  For a
+# cluster that pulls from a registry, use the overlay:
+#   kubectl apply -k k8s/overlay-registry

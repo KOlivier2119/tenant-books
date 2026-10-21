@@ -1,0 +1,37 @@
+# Public entry point.  Written for the laptop (traefik, plain HTTP) with the
+# production TLS block included but commented, because cert-manager is not
+# installed on this box - see docs/part3-kubernetes.md "Not verified".
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tenantbooks
+  labels:
+    app: frontend
+  annotations:
+    # The UI uploads attachments and the PDF job fetches assets; nginx/traefik
+    # defaults (1 MB) would fail those with a 413 that looks like an app bug.
+    nginx.ingress.kubernetes.io/proxy-body-size: 50m
+    traefik.ingress.kubernetes.io.router.entrypoints: web
+    # --- production TLS (needs cert-manager; see k8s/tls/issuer.yaml) ---
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    # traefik.ingress.kubernetes.io.router.entrypoints: websecure
+    # traefik.ingress.kubernetes.io.router.tls: "true"
+spec:
+  ingressClassName: traefik
+  rules:
+    # Frappe's site lookup is the Host header, so the Ingress rule name IS the
+    # tenant identifier.  Adding a tenant = adding a site directory + a rule
+    # here; nothing in the app changes.
+    - host: tenantbooks.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 8080
+  # tls:
+  #   - hosts: [tenantbooks.example.com]
+  #     secretName: tenantbooks-tls   # created and renewed by cert-manager

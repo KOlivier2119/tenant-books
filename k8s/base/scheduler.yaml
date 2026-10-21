@@ -1,0 +1,62 @@
+# `bench schedule` runs the cron/daily/hourly entries declared in
+# tenantbooks/hooks.py (overdue sweep, webhook retry sweep, log purge).
+#
+# replicas MUST stay 1 unless you add leader election: two schedulers mean every
+# scheduled job fires twice.  Frappe does not deduplicate scheduler jobs across
+# processes, and the retry sweep is not idempotent (it would double-attempt a
+# delivery and burn the retry budget).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+  labels:
+    app: scheduler
+    tier: frappe
+spec:
+  replicas: 1
+  strategy:
+    # maxSurge: 1 (the pattern used elsewhere) would run two schedulers at once
+    # during an upgrade and double-fire every job; maxUnavailable: 0 leaves a
+    # window with none.  For a singleton the honest answer is Recreate.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: scheduler
+  template:
+    metadata:
+      labels:
+        app: scheduler
+        tier: frappe
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 0
+      containers:
+        - name: scheduler
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          command: ["bench", "schedule"]
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 768Mi
+      # No probe on purpose.  `bench schedule` is PID 1, so if it dies the
+      # container dies and the Deployment replaces it - a liveness probe would
+      # only re-check "is python still running".  The failure that actually
+      # matters is "a scheduled job stopped running", and the only signal for
+      # that is job freshness, which is Part 5's alert on the scheduler's last
+      # successful run, not a kubelet probe.
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: logs

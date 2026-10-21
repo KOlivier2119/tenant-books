@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  # Everything below lives here, so a NetworkPolicy can be written as
+  # "namespaceSelector: {}" meaning "this namespace only", and `kubectl -n`
+  # needs no guessing.
+  name: tenantbooks
+  labels:
+    app.kubernetes.io/name: tenantbooks
+    app.kubernetes.io/part-of: frappe

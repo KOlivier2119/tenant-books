@@ -1,0 +1,105 @@
+# nginx: serves /assets/* and /files/* straight from the sites volume, proxies
+# everything else to backend:8000 and /socket.io to websocket:9000.
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels:
+    app: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    app: frontend
+    tier: frappe-frontend
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        tier: frappe-frontend
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 0
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: nginx
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          # Same image as the backend, different entrypoint - that is the whole
+          # point of building one image and running seven roles from it.
+          command: ["nginx-entrypoint.sh"]
+          env:
+            # nginx-entrypoint.sh renders its config template from these.
+            - name: BACKEND
+              value: backend:8000
+            - name: SOCKETIO
+              value: websocket:9000
+            - name: PROXY_READ_TIMEOUT
+              value: "120"
+            - name: CLIENT_MAX_BODY_SIZE
+              value: 50m
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # No Host header needed here (verified in Part 2 on the same health
+          # check): nginx is told the site name by FRAPPE_SITE_NAME_HEADER and
+          # puts it on the upstream request itself.  nginx answers even when the
+          # backend is down, for /assets/, so this probe measures the proxy.
+          startupProbe:
+            httpGet:
+              path: /api/method/ping
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /api/method/ping
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/method/ping
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: sites

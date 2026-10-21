@@ -1,0 +1,237 @@
+# One-shot bootstrapping: the Kubernetes equivalent of the `setup` service in
+# docker/compose.prod.yaml.
+#
+# Kubernetes has no Job DAG, so the order is enforced by whoever deploys:
+# run `create-site` to completion first, then `migrate` on every later release.
+# A Job's .spec.template is immutable, so `kubectl apply` cannot re-run one that
+# already finished - delete and create it instead:
+#   kubectl -n tenantbooks delete job create-site --ignore-not-found
+#   kubectl -n tenantbooks create -f job-create-site.yaml   # or from the kustomize output
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-site
+  labels:
+    app: create-site
+    tier: frappe
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: create-site
+        tier: frappe
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 0
+      initContainers:
+        - name: seed-sites-volume
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          # THE docker-vs-kubernetes difference that bites here:
+          # a Docker named volume is pre-populated from whatever the image had at
+          # that path ("copy-on-create"), which is how the compose stack got
+          # apps.txt and /sites/assets for free.  A Kubernetes PVC is always born
+          # EMPTY, and mounting it over /home/frappe/frappe-bench/sites therefore
+          # hides the apps.txt, the built asset bundles and the placeholder
+          # common_site_config.json that the image baked in.  Every pod would then
+          # fail with "Site apps.txt does not exist" / 404 CSS.
+          # Fix: mount the PVC at a path that is NOT its final home, so the image's
+          # own content is still visible, and copy it across - once.
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              if [ ! -f /seed/apps.txt ]; then
+                echo "seeding empty PVC from the image's sites/ directory"
+                cp -a /home/frappe/frappe-bench/sites/. /seed/
+              else
+                echo "PVC already seeded, skipping"
+              fi
+          volumeMounts:
+            - name: sites
+              mountPath: /seed
+        - name: wait-for-db
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          # There is no `depends_on: condition: service_healthy` in Kubernetes.
+          # The DB is a StatefulSet that becomes Ready on its own; a pod that only
+          # needs "can I talk to it" waits with a 60-second budget and then fails
+          # the Job loudly, rather than leaving bench to retry a connection for 10
+          # minutes.
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              for i in $(seq 1 60); do
+                if mysqladmin --protocol=tcp --host="$DB_HOST" --port="$DB_PORT" \
+                     --user=root --password="$DB_ROOT_PASSWORD" ping >/dev/null 2>&1; then
+                  echo "mariadb is up after ${i}s"; exit 0
+                fi
+                sleep 1
+              done
+              echo "mariadb never answered on $DB_HOST:$DB_PORT" >&2
+              exit 1
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+            - secretRef:
+                name: tenantbooks-secrets
+      containers:
+        - name: create-site
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              cd /home/frappe/frappe-bench
+
+              # 1. bench-wide connection settings -> sites/common_site_config.json
+              bench set-config -g db_host "$DB_HOST"
+              bench set-config -gp db_port "$DB_PORT"
+              bench set-config -g redis_cache "redis://$REDIS_CACHE"
+              bench set-config -g redis_queue "redis://$REDIS_QUEUE"
+              bench set-config -g redis_socketio "redis://$REDIS_QUEUE"
+              bench set-config -gp socketio_port "$SOCKETIO_PORT"
+
+              # 2. the tenant itself.  Idempotent: re-running this Job on an
+              # existing cluster must not try to recreate the site.
+              if [ ! -d "sites/$SITE_NAME" ]; then
+                bench new-site \
+                  --db-root-username root \
+                  --db-root-password "$DB_ROOT_PASSWORD" \
+                  --admin-password "$ADMIN_PASSWORD" \
+                  --mariadb-user-host-login-scope='%' \
+                  --install-app tenantbooks \
+                  --set-default \
+                  "$SITE_NAME"
+              else
+                echo "site $SITE_NAME already exists, skipping new-site"
+              fi
+
+              # 3. app settings + the two values that make outbound PDF/webhook
+              # work from inside a pod (see Part 1 bug 6 and Part 2 section 9).
+              bench --site "$SITE_NAME" set-config -g webhook_url "$WEBHOOK_URL"
+              bench --site "$SITE_NAME" set-config -g webhook_secret "$WEBHOOK_SECRET"
+              bench --site "$SITE_NAME" set-config host_name "$FRAPPE_HOST_NAME"
+              bench --site "$SITE_NAME" set-config webserver_port "$FRAPPE_WEBSERVER_PORT"
+
+              # 4. --install-app only creates the DocType tables; the app's
+              # after_install hook (which creates the Billing roles) and the
+              # custom indexes run under migrate.
+              bench --site "$SITE_NAME" migrate
+              bench --site "$SITE_NAME" clear-cache
+              echo "create-site done"
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+            - secretRef:
+                name: tenantbooks-secrets
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: logs
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  labels:
+    app: migrate
+    tier: frappe
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: migrate
+        tier: frappe
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 0
+      initContainers:
+        - name: wait-for-db
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              for i in $(seq 1 60); do
+                if mysqladmin --protocol=tcp --host="$DB_HOST" --port="$DB_PORT" \
+                     --user=root --password="$DB_ROOT_PASSWORD" ping >/dev/null 2>&1; then
+                  echo "mariadb is up after ${i}s"; exit 0
+                fi
+                sleep 1
+              done
+              echo "mariadb never answered on $DB_HOST:$DB_PORT" >&2
+              exit 1
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+            - secretRef:
+                name: tenantbooks-secrets
+      containers:
+        - name: migrate
+          image: tenantbooks:v15.103.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              cd /home/frappe/frappe-bench
+              bench --site "$SITE_NAME" migrate
+              bench --site "$SITE_NAME" clear-cache
+              bench --site "$SITE_NAME" clear-website-cache
+              bench --version
+          envFrom:
+            - configMapRef:
+                name: tenantbooks-env
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
+      volumes:
+        - name: sites
+          persistentVolumeClaim:
+            claimName: sites
+        - name: logs
+          persistentVolumeClaim:
+            claimName: logs

@@ -1,0 +1,42 @@
+# NOT part of k8s/base/kustomization.yaml, on purpose: applying a
+# cert-manager.io/v1 document on a cluster without cert-manager fails with
+# "no matches for kind Issuer", which would make the whole stack look broken.
+#
+# Install cert-manager first, then apply this:
+#   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
+#   kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=180s
+#   kubectl apply -f k8s/tls/issuer.yaml
+#   # then uncomment the tls: block + cert-manager annotations in
+#   # k8s/base/ingress.yaml and re-deploy
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    # staging directory first: production rate-limits failed validations hard
+    # (5 blocked registrations/week/domain), and a typo in an ingress annotation
+    # burns that budget silently.
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik
