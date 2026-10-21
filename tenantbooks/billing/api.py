@@ -5,7 +5,8 @@ Only functions decorated with @frappe.whitelist() are reachable over HTTP, at:
 
 Auth: send the API key/secret pair as HTTP Basic auth, or as headers
     Authorization: token <API_KEY>:<API_SECRET>
-The user owning the key must hold the matching role - see docs/RBAC.md.
+The user owning the key must hold the matching role - see docs/part1-frappe-app.md.
+Full request/response contract: docs/openapi.yaml.
 """
 
 import json

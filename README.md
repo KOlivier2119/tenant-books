@@ -7,10 +7,14 @@ run on a laptop, and anything unverified is labelled.
 Concepts, the role matrix, the API contract and the EXPLAIN evidence are in
 [docs/part1-frappe-app.md](docs/part1-frappe-app.md). Packaging, the multi-stage
 image and the prod-shaped compose stack are in
-[docs/part2-docker.md](docs/part2-docker.md).
+[docs/part2-docker.md](docs/part2-docker.md). Cluster walkthrough, probes, HPA and
+the defect list are in [docs/part3-kubernetes.md](docs/part3-kubernetes.md).
+The machine-readable API reference (OpenAPI 3.1, validated and rendered) is
+[docs/openapi.yaml](docs/openapi.yaml) - serve it with
+`docker run -p 8085:8080 -e SWAGGER_JSON=/specs/openapi.yaml -v $PWD/docs:/specs swaggerapi/swagger-ui`.
 
-Progress: **Part 1 (Frappe app) and Part 2 (Docker) are done and were run.**
-Part 3 Kubernetes, Part 4 CI/CD, Part 5 observability, Part 6 DB ops/security
+Progress: **Parts 1 (Frappe app), 2 (Docker) and 3 (Kubernetes) are done and were
+run on this machine.** Part 4 CI/CD, Part 5 observability, Part 6 DB ops/security
 and Part 7 Linux/runbooks follow.
 
 ## Part 1 status: the Frappe app (complete and tested)

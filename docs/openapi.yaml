@@ -1,0 +1,1002 @@
+openapi: "3.1.0"
+info:
+  title: TenantBooks API
+  version: 0.0.1
+  summary: Multi-tenant orders and invoicing on Frappe v15
+  description: |
+    TenantBooks is a Frappe app, so it exposes two different API surfaces and both
+    are documented here:
+
+    1. **Three hand-written endpoints** under `/api/v2/method/tenantbooks.billing.api.*`
+       (`create_order`, `get_invoice_status`, `list_overdue_invoices`). Only functions
+       decorated with `@frappe.whitelist()` are reachable at all.
+    2. **The generic document API that Frappe generates** for every DocType
+       (`/api/resource/...` and `/api/v2/document/...`): list, read, create, update,
+       delete, with the same role permissions enforced as the hand-written ones.
+       You get CRUD for `Order`, `Invoice`, `Customer Account`, `Product` and
+       `Webhook Delivery Log` without writing a line of code.
+
+    ### One request, four layers
+
+    ```
+    client -> Ingress (host match) -> nginx (frontend pod) -> gunicorn (backend pod)
+             -> Frappe resolves the SITE from the Host header -> router -> your function
+    ```
+
+    The Host header *is* the tenant. A request whose Host does not match a site
+    directory returns **HTTP 404** even for `/api/method/ping` (measured: hitting the
+    load-balancer IP without a Host header gives 404). This is why the Kubernetes
+    readiness probes send `httpHeaders: [{name: Host, ...}]` and why `curl`ing a
+    ClusterIP with the right Host works while `curl`ing the LB address from a pod
+    does not.
+
+    ### Authentication
+
+    API keys are per-user, and the user's roles decide what the key can do
+    (`Billing Clerk` may create, `Billing Manager` may also delete; anonymous can read
+    nothing but `/api/method/ping`). Three ways to send them, **two of which work**:
+
+    | Header | Works? |
+    | --- | --- |
+    | `Authorization: token <API_KEY>:<API_SECRET>` | yes, HTTP 200 |
+    | `Authorization: Basic base64(<API_KEY>:<API_SECRET>)` | yes, HTTP 200 |
+    | `Authorization: Bearer <API_KEY>:<API_SECRET>` | **no** - `AuthenticationError` |
+
+    A browser session (`POST /api/method/login`) sets `frappe_cookie`, which also
+    authenticates the same endpoints.
+
+    ### Error envelopes: two shapes, deliberately
+
+    `/api/resource/...` (the older v1 router) and `/api/v2/...` format failures
+    differently. Both are documented on each operation because a client that parses
+    only one will mis-report failures:
+
+    * v1: `{"exc_type": "DoesNotExistError", "_server_messages": "[...]"}` (HTTP 404)
+    * v2: `{"errors": [{"type", "message", "title", "indicator"}]}` (HTTP 404)
+    * success in both: `{"data": ...}`
+
+    ### Document lifecycle (`docstatus`)
+
+    `Order` and `Invoice` are *submittable*: `docstatus` 0 = draft, 1 = submitted
+    (immutable), 2 = cancelled. `create_order` inserts **and submits** in one call,
+    which is what triggers the whole downstream chain - stock decrement, Invoice
+    creation, PDF job, webhook job. Generic `POST /api/resource/Order` only creates a
+    draft; you would then submit it. Names come from `autoname`:
+    `TB-ORD-.YYYY.-.####` and `TB-INV-.YYYY.-.#####`.
+  contact:
+    name: TenantBooks demo app
+  license:
+    name: MIT
+    identifier: MIT
+
+servers:
+  - url: http://tenantbooks.localhost
+    description: >
+      Kubernetes - Traefik Ingress rule (frontend Service behind it). Add
+      `tenantbooks.localhost` to /etc/hosts or use `curl --resolve`.
+  - url: http://localhost:8080
+    description: >
+      docker compose (docker/compose.prod.yaml) - the same app, published on the
+      host. MUST send the header `Host: tenantbooks.localhost`, because Frappe
+      picks the site from it.
+
+tags:
+  - name: health
+    description: Unauthenticated liveness. Used by Kubernetes probes.
+  - name: orders
+    description: The hand-written, business-level endpoints.
+  - name: invoices
+    description: Status polling and the dunning list - the read side of the async chain.
+  - name: catalogue
+    description: Customer Account and Product - plain documents.
+  - name: documents
+    description: Frappe's generated CRUD for any DocType.
+  - name: files
+    description: Invoice PDFs, rendered by the long queue onto the shared volume.
+  - name: webhooks
+    description: The outbound HMAC delivery - a contract you implement, not an endpoint we host.
+  - name: session
+    description: Cookie login, for browser-style access.
+
+security:
+  - frappeToken: []
+  - frappeBasic: []
+
+paths:
+  /api/method/ping:
+    get:
+      tags: [health]
+      summary: Liveness check
+      description: |
+        No authentication, and the *only* endpoint that answers regardless of which
+        site the Host header selects... except that it does not: an unknown Host gives
+        404 here too, which is what makes it a site-aware probe rather than a
+        cluster-wide one.
+      operationId: ping
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/Host"
+      responses:
+        "200":
+          description: The site resolved and the app server is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message:
+                    const: pong
+              example:
+                message: pong
+        "404":
+          description: Host header did not match any site in `sites/`.
+
+  /api/v2/method/tenantbooks.billing.api.create_order:
+    post:
+      tags: [orders]
+      summary: Create and submit an Order (which creates the Invoice)
+      description: |
+        The one entry point that drives the whole application. In order:
+
+        1. `frappe.has_permission("Order", "create", throw=True)` -> 403 for a role
+           that may not write, and for an anonymous caller.
+        2. Read permission is checked on *that customer*, so a User Permission row
+           restricting a clerk to their own accounts is enforced here.
+        3. Builds the `Order`, appends `items` rows, throws `ValidationError` if empty.
+        4. `insert()` then `submit()` - the submit fires the controller hooks that
+           decrement `Product.stock_qty`, create + submit the `Invoice`, and enqueue
+           two jobs on the `long` queue: `generate_invoice_pdf` and `deliver_webhook`.
+        5. `frappe.db.commit()`.
+
+        The response returns as soon as the rows are committed; the PDF and the
+        webhook are asynchronous, so poll `/api/v2/method/tenantbooks.billing.api.get_invoice_status`
+        (the PDF appears as `invoice_pdf`) or read the delivery log at
+        `/api/resource/Webhook Delivery Log?invoice=...`.
+
+        Known gap: there is no idempotency key, so a duplicate POST creates a second
+        Order. Rate limiting is not implemented either.
+      operationId: createOrder
+      parameters:
+        - $ref: "#/components/parameters/Host"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOrderRequest"
+            examples:
+              oneLine:
+                summary: one product, two copies
+                value:
+                  customer: Northwind Books
+                  items:
+                    - { product: BOOK-101, qty: 2, rate: 25.0 }
+              dated:
+                summary: back-dated order
+                value:
+                  customer: Apress Print
+                  order_date: "2026-03-01"
+                  items:
+                    - { product: BOOK-303, qty: 1 }
+      responses:
+        "200":
+          description: Order inserted and submitted; Invoice created and submitted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateOrderResponse"
+              example:
+                data:
+                  name: TB-ORD-2026-0003
+                  net_total: 18.0
+                  invoice: TB-INV-2026-00003
+        "403":
+          description: Role lacks Order:create, or may not read that Customer Account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V2Error"
+              example:
+                errors:
+                  - type: PermissionError
+                    message: "Not permitted to create Order"
+        "404":
+          description: Customer Account does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V2Error"
+              example:
+                errors:
+                  - type: DoesNotExistError
+                    message: "Customer Account Riverside Press not found"
+        "417":
+          description: Validation failed (no items, unknown product, insufficient stock). Frappe returns 417 for `ValidationError`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V2Error"
+              example:
+                errors:
+                  - type: ValidationError
+                    message: "At least one order item is required"
+
+  /api/v2/method/tenantbooks.billing.api.get_invoice_status:
+    get:
+      tags: [invoices]
+      summary: Status of one invoice, including whether the PDF exists yet
+      operationId: getInvoiceStatus
+      parameters:
+        - $ref: "#/components/parameters/Host"
+        - name: invoice
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: "^TB-INV-[0-9]{4}-[0-9]{5}$"
+            example: TB-INV-2026-00003
+      responses:
+        "200":
+          description: The status projection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvoiceStatus"
+              example:
+                data:
+                  name: TB-INV-2026-00003
+                  status: Unpaid
+                  grand_total: 18.0
+                  due_date: "2026-11-20"
+                  customer: Apress Print
+                  invoice_pdf: /files/TB-INV-2026-00003.pdf
+        "403":
+          description: Caller may not read this Invoice.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V2Error"
+        "404":
+          description: No such invoice.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V2Error"
+
+  /api/v2/method/tenantbooks.billing.api.list_overdue_invoices:
+    get:
+      tags: [invoices]
+      summary: Page of overdue invoices for a dunning run
+      description: |
+        `frappe.get_list` applies role and user permissions, so a clerk only ever sees
+        rows they may read - the filtering is not in this function's code.
+        `page_length` is clamped to 200 server-side. Sorted by `due_date asc`.
+      operationId: listOverdueInvoices
+      parameters:
+        - $ref: "#/components/parameters/Host"
+        - name: start
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: page_length
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: Rows, oldest due first. Empty array is a success, not an error.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OverdueInvoice"
+              example:
+                data:
+                  - name: TB-INV-2026-00001
+                    customer: Northwind Books
+                    grand_total: 50.0
+                    due_date: "2026-09-30"
+                    order: TB-ORD-2026-0001
+        "403":
+          description: Caller may not read Invoice at all.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V2Error"
+
+  /api/resource/{doctype}:
+    parameters:
+      - $ref: "#/components/parameters/Host"
+      - $ref: "#/components/parameters/doctype"
+    get:
+      tags: [documents]
+      summary: List documents of a DocType
+      description: |
+        Generated by Frappe for every DocType. Filtering, field selection and paging
+        are query parameters, not a body: `filters`, `fields`, `order_by`, `limit`,
+        `offset`. `fields` must be a JSON array *string*, e.g.
+        `?fields=["name","status"]`.
+      operationId: listDocuments
+      parameters:
+        - name: fields
+          in: query
+          description: JSON array of fieldnames, URL-encoded. Default is `["name"]`.
+          schema: { type: string, example: '["name","status"]' }
+        - name: filters
+          in: query
+          description: >
+            JSON object or nested list, URL-encoded.
+            e.g. `filters={"docstatus":1,"status":"Overdue"}` or
+            `[["Invoice","status","=","Overdue"]]`.
+          schema: { type: string }
+        - name: order_by
+          in: query
+          schema: { type: string, example: "due_date asc" }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: Array of projected documents.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+              example:
+                data: [{ name: TB-ORD-2026-0001 }, { name: TB-ORD-2026-0002 }]
+        "403":
+          $ref: "#/components/responses/V1PermissionError"
+    post:
+      tags: [documents]
+      summary: Create a document (draft)
+      description: |
+        Measured against `Product`: returns the full document with HTTP 200. For a
+        submittable DocType this creates `docstatus: 0` only - submission is a
+        separate step, so stock, invoices and webhooks do NOT move until you submit.
+        Deleting the probe row afterwards returned `{"data":"ok"}` with HTTP 202.
+      operationId: createDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Field values; `doctype` is taken from the path.
+              example:
+                item_code: API-PROBE-999
+                item_name: probe
+                unit_price: 1.0
+                stock_qty: 1
+      responses:
+        "200":
+          description: The stored document, defaults filled in.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "403":
+          $ref: "#/components/responses/V1PermissionError"
+
+  /api/resource/{doctype}/{name}:
+    parameters:
+      - $ref: "#/components/parameters/Host"
+      - $ref: "#/components/parameters/doctype"
+      - $ref: "#/components/parameters/name"
+    get:
+      tags: [documents]
+      summary: Read one document
+      operationId: getDocument
+      responses:
+        "200":
+          description: The full document including `docstatus`, `owner`, `creation`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    description: >
+                      Shape depends on the DocType in the path; the five app
+                      DocTypes are spelled out in components/schemas.
+                    oneOf:
+                      - $ref: "#/components/schemas/Order"
+                      - $ref: "#/components/schemas/Invoice"
+                      - $ref: "#/components/schemas/CustomerAccount"
+                      - $ref: "#/components/schemas/Product"
+                      - $ref: "#/components/schemas/WebhookDeliveryLog"
+        "404":
+          description: No such document. v1 shape, not the v2 one.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Error"
+              example:
+                exc_type: DoesNotExistError
+                _server_messages: '[{"message": "Order NOPE-1 not found"}]'
+        "403":
+          $ref: "#/components/responses/V1PermissionError"
+    put:
+      tags: [documents]
+      summary: Replace a document
+      operationId: replaceDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Updated document.
+          content:
+            application/json:
+              schema: { type: object }
+        "403":
+          $ref: "#/components/responses/V1PermissionError"
+    delete:
+      tags: [documents]
+      summary: Delete a document
+      description: |
+        Requires `delete` permission, which in this app only `Billing Manager` has -
+        that separation is covered by `test_manager_can_delete` /
+        `test_clerk_can_create_but_not_delete`. Submitted documents (`docstatus: 1`)
+        cannot be deleted; cancel them first.
+      operationId: deleteDocument
+      responses:
+        "202":
+          description: Deletion accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { const: ok }
+              example:
+                data: ok
+        "403":
+          $ref: "#/components/responses/V1PermissionError"
+
+  /api/v2/document/{doctype}:
+    parameters:
+      - $ref: "#/components/parameters/Host"
+      - $ref: "#/components/parameters/doctype"
+    post:
+      tags: [documents]
+      summary: Create a document (v2 router, v2 error envelope)
+      operationId: createDocumentV2
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Stored document.
+          content:
+            application/json:
+              schema: { type: object }
+        "404":
+          description: v2 error shape.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V2Error"
+
+  /api/v2/document/{doctype}/{name}:
+    parameters:
+      - $ref: "#/components/parameters/Host"
+      - $ref: "#/components/parameters/doctype"
+      - $ref: "#/components/parameters/name"
+    get:
+      tags: [documents]
+      summary: Read one document (v2 router)
+      description: Identical payload to the v1 route; the difference is only the error shape.
+      operationId: getDocumentV2
+      responses:
+        "200":
+          description: The document.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+              example:
+                data:
+                  name: TB-ORD-2026-0003
+                  docstatus: 1
+                  customer: Apress Print
+                  net_total: 18.0
+        "404":
+          description: v2 error shape (measured).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V2Error"
+              example:
+                errors:
+                  - type: DoesNotExistError
+                    message: "Order NOPE-1 not found"
+                    title: Message
+                    indicator: red
+
+  /files/{fileName}:
+    get:
+      tags: [files]
+      summary: Download a stored file (the rendered invoice PDF)
+      description: |
+        The PDF job writes to `sites/{site}/public/files/` on the shared `sites`
+        PVC, and the `File` record's `file_url` is what
+        `get_invoice_status.invoice_pdf` returns. Public files are served with the
+        document's own permissions; private files require an authenticated session
+        or API key. Because the file lives on a ReadWriteOnce/ReadWriteMany PVC, the
+        pod that rendered it and the pod that serves it may be different ones - that
+        is the point of the shared volume.
+      operationId: getFile
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/Host"
+        - name: fileName
+          in: path
+          required: true
+          schema:
+            type: string
+            example: TB-INV-2026-00002.pdf
+      responses:
+        "200":
+          description: The file bytes.
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Not stored yet (the long queue has not run the job).
+
+  /webhook/invoice.submitted:
+    post:
+      tags: [webhooks]
+      summary: OUTBOUND - what TenantBooks POSTs to your receiver
+      description: |
+        **This is not an endpoint on this server.** It is the contract for the request
+        that TenantBooks sends to *your* URL, taken from
+        `sites/{site}/site_config.json` (`webhook_url`, `webhook_secret`). The path
+        below is only a placeholder for the receiver you configure.
+
+        Headers sent:
+
+        | Header | Value |
+        | --- | --- |
+        | `Content-Type` | `application/json` |
+        | `X-TenantBooks-Event` | `invoice.submitted` |
+        | `X-TenantBooks-Signature` | `sha256=<hex hmac of the raw body>` |
+
+        The bytes that are signed are the bytes that are sent:
+        `json.dumps(payload, sort_keys=True, separators=(",", ":"))`. Verify the HMAC
+        over the **raw request body**, never over a re-serialised copy, and compare it
+        in constant time (`hmac.compare_digest`). Return 2xx or the attempt counts as
+        failed.
+
+        Failure handling: timeout is 10s, at most 5 attempts, exponential backoff
+        60s/120s/240s... capped at 3600s with up to 25% jitter. Because Frappe v15's
+        `frappe.enqueue` cannot forward RQ's `delay`/`retry`, the retry schedule lives
+        in the `Webhook Delivery Log` row (`next_retry_at`) and a scheduler job on
+        `*/5 * * * *` re-enqueues rows whose window has passed.
+
+        Try it locally against the bundled mock receiver, which answers 500 when
+        queried with `?fail=1` so you can watch the state machine:
+
+        ```bash
+        curl -sS -X POST -H "Host: tenantbooks.localhost" \
+          http://localhost:8080/api/v2/method/tenantbooks.billing.api.create_order \
+          -H 'Content-Type: application/json' \
+          -H "Authorization: token $API_KEY:$API_SECRET" \
+          -d '{"customer":"Northwind Books","items":[{"product":"BOOK-101","qty":2,"rate":25}]}'
+        docker compose -f docker/compose.prod.yaml logs mock-receiver | grep -E 'ACCEPTED|REJECTED'
+        ```
+      operationId: invoiceSubmittedWebhook
+      security: []
+      parameters:
+        - name: X-TenantBooks-Event
+          in: header
+          required: true
+          schema: { type: string, const: invoice.submitted }
+        - name: X-TenantBooks-Signature
+          in: header
+          required: true
+          description: >
+            `sha256=<hex>` - HMAC-SHA256 of the raw body with the tenant's secret.
+          schema:
+            type: string
+            pattern: "^sha256=[0-9a-f]{64}$"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InvoiceWebhookPayload"
+      responses:
+        "200":
+          description: Accepted. The delivery log row becomes `Sent` and `next_retry_at` is cleared.
+        "401":
+          description: Signature mismatch on your side - recorded as a failed attempt, then retried.
+        "500":
+          description: Row becomes `Retrying` with `next_retry_at` set by the backoff.
+
+  /api/method/login:
+    post:
+      tags: [session]
+      summary: Cookie login for browser sessions
+      description: |
+        Form-encoded `usr` and `pwd`. On success Frappe sets `frappe_cookie`; every
+        endpoint above also accepts that cookie instead of an API key. Two-factor
+        authentication for `System Manager` is configured but was never exercised
+        end-to-end (see README "Not verified yet").
+      operationId: login
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/Host"
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [usr, pwd]
+              properties:
+                usr: { type: string, example: Administrator }
+                pwd: { type: string }
+      responses:
+        "200":
+          description: Logged in; `frappe_cookie` set on the response.
+        "401":
+          description: Bad credentials.
+
+  /api/method/logout:
+    get:
+      tags: [session]
+      summary: End the cookie session
+      operationId: logout
+      parameters:
+        - $ref: "#/components/parameters/Host"
+      responses:
+        "200":
+          description: Session dropped.
+        "404":
+          description: Host header did not match any site (the same rule as `/api/method/ping`).
+
+components:
+  # The three parameters every path needs, written once and $ref'd by each operation.
+  parameters:
+    Host:
+      name: Host
+      in: header
+      required: false
+      description: >
+        The tenant selector. Frappe maps this value to a directory under `sites/`;
+        an unmatched value is HTTP 404, not an authentication failure. On the
+        Kubernetes Ingress the value is set by the routing rule; with
+        `docker compose` publishing 8080 you must send it yourself
+        (`curl -H 'Host: tenantbooks.localhost'` or `--resolve`).
+      schema:
+        type: string
+        default: tenantbooks.localhost
+        example: tenantbooks.localhost
+    doctype:
+      name: doctype
+      in: path
+      required: true
+      description: >
+        The DocType, in the form that router expects: the *exact* name for
+        `/api/resource/...` (`Order`, `Customer%20Account`,
+        `Webhook%20Delivery%20Log`) and the *kebab-case* form for
+        `/api/v2/document/...` (`order`, `customer-account`,
+        `webhook-delivery-log`). App DocTypes: `Order`, `Invoice`,
+        `Customer Account`, `Product`, `Webhook Delivery Log`. Spaces must be
+        URL-encoded.
+      schema:
+        type: string
+        example: Order
+    name:
+      name: name
+      in: path
+      required: true
+      description: Document name (the `autoname` result, or the field it copies).
+      schema:
+        type: string
+        example: TB-ORD-2026-0003
+
+  securitySchemes:
+    frappeToken:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: >
+        `token <API_KEY>:<API_SECRET>`. Keys belong to a Frappe User, and that user's
+        roles are what actually authorise the call. Generate locally:
+        `bench --site tenantbooks.localhost execute
+         frappe.core.doctype.user.user.generate_keys --args '["Administrator"]'`
+        (`bench execute` commits; `bench console` does not).
+    frappeBasic:
+      type: http
+      scheme: basic
+      description: >
+        API key as the username, API secret as the password. Verified working
+        (`curl -u <key>:<secret>`) - the OAuth-style `Bearer` scheme is not, so do
+        not "modernise" this header.
+
+  responses:
+    V1PermissionError:
+      description: Role or User Permission denied the action (v1 envelope, HTTP 403).
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              exception: { type: string, example: frappe.exceptions.PermissionError }
+              exc_type: { type: string, example: PermissionError }
+              _server_messages: { type: string }
+
+  schemas:
+    CreateOrderRequest:
+      type: object
+      required: [customer]
+      additionalProperties: false
+      properties:
+        customer:
+          type: string
+          description: Customer Account name - seeded values are `Northwind Books` and `Apress Print`.
+          example: Northwind Books
+        order_date:
+          type: string
+          format: date
+          description: Defaults to today (`getdate()`) when omitted.
+        items:
+          type: array
+          minItems: 1
+          description: >
+            Order Item child rows. Accepts a JSON array or a JSON *string* holding one
+            (form-encoded calls arrive as strings, hence `_as_list`). `rate` defaults
+            to the Product's `unit_price` when omitted.
+          items:
+            $ref: "#/components/schemas/OrderItemInput"
+
+    OrderItemInput:
+      type: object
+      required: [product, qty]
+      additionalProperties: false
+      properties:
+        product:
+          type: string
+          description: Product name (`item_code`), e.g. BOOK-101, BOOK-202, BOOK-303.
+          example: BOOK-101
+        qty:
+          type: integer
+          minimum: 1
+          example: 2
+        rate:
+          type: number
+          format: float
+          description: Optional override of the product's unit_price.
+          example: 25.0
+
+    CreateOrderResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [name, net_total, invoice]
+          properties:
+            name:
+              type: string
+              pattern: "^TB-ORD-[0-9]{4}-[0-9]{4}$"
+              example: TB-ORD-2026-0003
+            net_total:
+              type: number
+              format: float
+              example: 18.0
+            invoice:
+              type: string
+              pattern: "^TB-INV-[0-9]{4}-[0-9]{5}$"
+              example: TB-INV-2026-00003
+
+    InvoiceStatus:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          properties:
+            name: { type: string, example: TB-INV-2026-00003 }
+            status:
+              type: string
+              enum: [Unpaid, Paid, Overdue]
+              description: >
+                `Overdue` is not set by any user action: the scheduler's cron job
+                `tenantbooks.billing.tasks.mark_overdue_invoices` (`30 0 * * *`)
+                flips unpaid-and-past-due invoices in one bulk UPDATE.
+            grand_total: { type: number, format: float, example: 18.0 }
+            due_date: { type: string, format: date, example: "2026-11-20" }
+            customer: { type: string, example: Apress Print }
+            invoice_pdf:
+              type: ["string", "null"]
+              description: >
+                Null until the long queue has rendered and attached the PDF - this is
+                the field that tells you the async half of the request finished.
+              example: /files/TB-INV-2026-00003.pdf
+
+    OverdueInvoice:
+      type: object
+      properties:
+        name: { type: string, example: TB-INV-2026-00001 }
+        customer: { type: string, example: Northwind Books }
+        grand_total: { type: number, format: float, example: 50.0 }
+        due_date: { type: string, format: date, example: "2026-09-30" }
+        order: { type: string, example: TB-ORD-2026-0001 }
+
+    Order:
+      type: object
+      description: A real `Order` document as the generic API returns it (trimmed).
+      properties:
+        name: { type: string, example: TB-ORD-2026-0003 }
+        owner: { type: string, example: Administrator }
+        creation: { type: string, example: "2026-10-21 10:50:55.672462" }
+        docstatus:
+          type: integer
+          enum: [0, 1, 2]
+          description: draft / submitted / cancelled
+        customer: { type: string, example: Apress Print }
+        order_date: { type: string, format: date }
+        net_total: { type: number, format: float, example: 18.0 }
+        invoice: { type: ["string", "null"], example: TB-INV-2026-00003 }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              product: { type: string, example: BOOK-303 }
+              qty: { type: integer, example: 1 }
+              rate: { type: number, example: 18.0 }
+              amount: { type: number, example: 18.0 }
+
+    Invoice:
+      type: object
+      description: >
+        Created and submitted by the Order controller hook, so it appears in the
+        `create_order` response. autoname is `TB-INV-.YYYY.-.#####`.
+      properties:
+        name: { type: string, example: TB-INV-2026-00003 }
+        docstatus: { type: integer, enum: [0, 1, 2] }
+        order: { type: string, example: TB-ORD-2026-0003 }
+        customer: { type: string, example: Apress Print }
+        status:
+          type: string
+          enum: [Unpaid, Paid, Overdue]
+          description: Flipped to `Overdue` by the nightly scheduler job, never by a user.
+        grand_total: { type: number, format: float, example: 18.0 }
+        due_date: { type: string, format: date, example: "2026-11-20" }
+        invoice_pdf:
+          type: ["string", "null"]
+          description: The `File` record's `file_url`, set once the long queue has rendered it.
+          example: /files/TB-INV-2026-00003.pdf
+
+    CustomerAccount:
+      type: object
+      description: autoname is `field:customer_name`, so the name IS the display name.
+      properties:
+        name: { type: string, example: Northwind Books }
+        customer_name: { type: string, example: Northwind Books }
+        email: { type: string, format: email }
+        phone: { type: string }
+        credit_limit:
+          type: number
+          format: float
+          description: Present but not enforced anywhere - a known gap.
+
+    Product:
+      type: object
+      description: autoname is `field:item_code`.
+      properties:
+        name: { type: string, example: BOOK-101 }
+        item_code: { type: string, example: BOOK-101 }
+        item_name: { type: string }
+        unit_price: { type: number, format: float }
+        stock_qty:
+          type: integer
+          description: Decrementing happens on Order submit, inside the controller hook.
+        reorder_level: { type: integer }
+
+    WebhookDeliveryLog:
+      type: object
+      description: >
+        The retry state machine, as data rather than in-memory timers, because
+        `frappe.enqueue` in v15 cannot pass RQ's `delay`/`retry` arguments. Read it with
+        `/api/resource/Webhook Delivery Log?invoice=TB-INV-2026-00003`.
+      properties:
+        name: { type: string }
+        invoice: { type: string, example: TB-INV-2026-00003 }
+        event: { type: string, example: invoice.submitted }
+        status:
+          type: string
+          enum: [Sent, Retrying, Failed]
+          description: Failed only after MAX_ATTEMPTS = 5.
+        attempts: { type: integer, example: 2 }
+        http_code: { type: ["integer", "null"], example: 200 }
+        next_retry_at:
+          type: ["string", "null"]
+          format: date-time
+          description: >
+            Exponential backoff with jitter: 60s, 120s, 240s ... capped at 3600s, plus
+            up to 25% random so a fleet of workers does not retry in lockstep. A
+            scheduler job on `*/5 * * * *` re-enqueues rows whose window has elapsed.
+            Stored in the site's time zone, which is not the pod's UTC log stamp.
+        url: { type: string }
+        signature:
+          type: string
+          example: "sha256=..."
+          description: "sha256=<hex> over the canonical JSON body, HMAC-SHA256, per-tenant secret."
+        response_body:
+          type: string
+          description: One appended line per attempt - the audit trail.
+        error: { type: ["string", "null"] }
+
+    V2Error:
+      type: object
+      description: The `/api/v2/...` error envelope (measured).
+      properties:
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, example: DoesNotExistError }
+              message: { type: string, example: "Order NOPE-1 not found" }
+              title: { type: string, example: Message }
+              indicator: { type: string, enum: [red, orange, green], example: red }
+
+    V1Error:
+      type: object
+      description: The `/api/resource/...` error envelope (measured).
+      properties:
+        exc_type: { type: string, example: DoesNotExistError }
+        exception: { type: string, example: frappe.exceptions.PermissionError }
+        exc: { type: string, description: "Python traceback, present when the site enables it" }
+        _server_messages: { type: string, description: "JSON-encoded array, despite the name" }
+
+    InvoiceWebhookPayload:
+      type: object
+      description: >
+        OUTBOUND body. The bytes that are signed are the bytes that are sent:
+        `json.dumps(payload, sort_keys=True, separators=(",", ":"))`. A receiver must
+        verify over the raw request body, never over a re-serialised copy - re-ordering
+        keys or adding whitespace breaks the HMAC.
+      required: [event, invoice, customer, order, grand_total, due_date, status, site]
+      properties:
+        event: { const: invoice.submitted }
+        invoice: { type: string, example: TB-INV-2026-00003 }
+        customer: { type: string, example: Apress Print }
+        order: { type: string, example: TB-ORD-2026-0003 }
+        grand_total: { type: number, format: float, example: 18.0 }
+        due_date: { type: string, format: date, example: "2026-11-20" }
+        status: { type: string, example: Unpaid }
+        site:
+          type: string
+          example: tenantbooks.localhost
+          description: Which tenant emitted the event - the multi-tenancy marker in the payload.
