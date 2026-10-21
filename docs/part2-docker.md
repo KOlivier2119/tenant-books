@@ -144,6 +144,20 @@ The image is also labelled with `org.opencontainers.image.base.name`, so
 `docker inspect` tells you which frappe version is inside without reading the
 Containerfile.
 
+### What an image tag should say
+
+`tenantbooks:v15.103.0` currently encodes the *frappe* version, which is arguable
+- it answers "which framework schema does this image write?" but not "which
+  commit of my app?". Part 4 tags pushed images with the git SHA
+(`ghcr.io/<owner>/tenant-books@sha256:...` and `:...-<sha>`) and keeps the frappe
+version in the OCI label instead. Rule of thumb: the tag is what you can type at
+a prompt during an incident (`:v15.103.0-2f8ac91`), the digest is what you pin a
+Deployment to, the labels are what you ask a running pod afterwards.
+
+`frappe/erpnext:v15.101.2` also shows why "pinned" needs care: that tag is
+*erpnext* 15.101.2 and contains *frappe* 15.103.0. Two different version spaces
+in one tag - which is exactly how a dev/prod schema drift gets started.
+
 ## 6. One image, seven processes
 
 `docker/compose.prod.yaml` starts the same topology as the dev stack, all from
