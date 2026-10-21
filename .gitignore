@@ -11,3 +11,5 @@ node_modules/
 volumes/
 sites_backup/
 .qoder/
+# real values for docker/prod.env.example, never committed
+docker/*.env

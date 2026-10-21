@@ -22,8 +22,8 @@ x-frappe-env: &frappe_env
   SOCKETIO_PORT: "9000"
   # Dev-only trick: make `import tenantbooks` resolve to the bind-mounted
   # source instead of pip-installing into each container's venv (which is
-  # recreated on every restart).  Production images bake the app in - see
-  # docker/Dockerfile.
+  # recreated on every restart).  Production bakes the app into the image -
+  # see docker/custom/Containerfile and docker/compose.prod.yaml.
   PYTHONPATH: /home/frappe/frappe-bench/apps/tenantbooks
 
 x-frappe-image: &frappe_image

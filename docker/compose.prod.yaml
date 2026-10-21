@@ -1,0 +1,300 @@
+# Production-shaped stack: same processes as docker/compose.local.yaml, but the
+# app is *inside* the image (docker/custom/Containerfile) instead of
+# bind-mounted, and every secret comes from an env file instead of being
+# hardcoded.
+#
+#   docker buildx build --secret id=apps_json,src=apps.json \
+#       -t tenantbooks:v15.103.0 -f docker/custom/Containerfile .
+#   cp docker/prod.env.example docker/prod.env   # then edit the passwords
+#   docker compose --env-file docker/prod.env -f docker/compose.prod.yaml up -d --wait
+#   open http://localhost:8081
+#
+# Deliberately NOT here: a Kubernetes-ready stack (Part 3), TLS (Part 3/6),
+# real backups (Part 6).  This file's job is to prove the image works with no
+# source mounted.
+
+name: tenantbooks-prod
+
+x-frappe-env: &frappe_env
+  DB_HOST: db
+  DB_PORT: "3306"
+  REDIS_CACHE: redis-cache:6379
+  REDIS_QUEUE: redis-queue:6379
+  SOCKETIO_PORT: "9000"
+  # No PYTHONPATH here, unlike compose.local.yaml.  The editable install
+  # `pip install -e apps/tenantbooks` was done at image build time, so
+  # `import tenantbooks` resolves without any path tricks.
+
+# Everything Frappe: one image, one bench, different process per role.
+x-app: &app
+  image: ${CUSTOM_IMAGE:-tenantbooks}:${CUSTOM_TAG:-v15.103.0}
+  networks: [frappe]
+  restart: unless-stopped
+  volumes:
+    # Named volumes, not bind mounts: nothing from the developer's working tree
+    # can end up in a running container.
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+  environment: *frappe_env
+  # gunicorn, workers and the scheduler all die if the DB is unreachable, so
+  # wait for the healthcheck instead of racing it.
+  depends_on:
+    db:
+      condition: service_healthy
+    redis-cache:
+      condition: service_started
+    redis-queue:
+      condition: service_started
+  # A container must not be able to escalate privileges via setuid binaries.
+  security_opt: [no-new-privileges:true]
+
+services:
+  # ---------------------------------------------------------------- database
+  db:
+    image: mariadb:11.4.13
+    networks: [frappe]
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in docker/prod.env}
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ------------------------------------------------------------------ redis
+  # Two instances on purpose: the cache may drop keys at any time (LRU), the
+  # queue must not, so only the queue gets persistence and a volume.
+  redis-cache:
+    image: redis:6.2.24-alpine
+    networks: [frappe]
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    deploy:
+      resources:
+        limits:
+          memory: 192m
+
+  redis-queue:
+    image: redis:6.2.24-alpine
+    networks: [frappe]
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-queue-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  # ------------------------------------------------- one-shot: create a site
+  # Idempotent: it rewrites site config and exits 0 when the site exists, which
+  # is what lets `up` be re-run after a change.  In Kubernetes this becomes a
+  # Job (Part 3).
+  create-site:
+    <<: *app
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    environment:
+      # YAML "<<" does not deep-merge: any service that sets environment: must
+      # pull in the shared map explicitly or it silently loses DB_HOST.
+      <<: *frappe_env
+      SITE_NAME: ${SITE_NAME:-tenantbooks.localhost}
+      DB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in docker/prod.env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in docker/prod.env}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://mock-receiver:8071/hook}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET in docker/prod.env}
+      FRAPPE_HOST_NAME: ${FRAPPE_HOST_NAME:-tenantbooks.localhost}
+      FRAPPE_WEBSERVER_PORT: ${FRAPPE_WEBSERVER_PORT:-8080}
+    command:
+      - |
+        set -euo pipefail
+        cd /home/frappe/frappe-bench
+
+        # Connection settings live in common_site_config.json (bench-wide).
+        bench set-config -g db_host "$$DB_HOST"
+        bench set-config -gp db_port "$$DB_PORT"
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE"
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE"
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE"
+        bench set-config -gp socketio_port "$$SOCKETIO_PORT"
+
+        if [ ! -d "sites/$$SITE_NAME" ]; then
+          bench new-site \
+            --db-root-username root \
+            --db-root-password "$$DB_ROOT_PASSWORD" \
+            --admin-password "$$ADMIN_PASSWORD" \
+            --mariadb-user-host-login-scope='%' \
+            --install-app tenantbooks \
+            --set-default \
+            "$$SITE_NAME"
+        fi
+
+        # App settings read back by frappe.get_conf() (tenantbooks/billing/webhooks.py)
+        bench --site "$$SITE_NAME" set-config -g webhook_url "$$WEBHOOK_URL"
+        bench --site "$$SITE_NAME" set-config -g webhook_secret "$$WEBHOOK_SECRET"
+
+        # Absolute URLs (PDF links, emails) are built from host_name +
+        # webserver_port.  On a cluster this is the Ingress host instead.
+        bench --site "$$SITE_NAME" set-config host_name "$$FRAPPE_HOST_NAME"
+        bench --site "$$SITE_NAME" set-config webserver_port "$$FRAPPE_WEBSERVER_PORT"
+
+  # ------------------------------------------------- one-shot: apply schema
+  # Runs after create-site and before the app containers, so no request ever
+  # hits an un-migrated schema.
+  migrate:
+    <<: *app
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    environment:
+      <<: *frappe_env
+      SITE_NAME: ${SITE_NAME:-tenantbooks.localhost}
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+    command:
+      - |
+        set -euo pipefail
+        bench --site "$$SITE_NAME" migrate
+        bench --site "$$SITE_NAME" clear-cache
+
+  # -------------------------------------------------------------- app roles
+  backend:
+    <<: *app
+    # image CMD: /usr/local/bin/start.sh -> gunicorn (see docker/custom/start.sh)
+    environment:
+      <<: *frappe_env
+      # Passed through from docker/prod.env so a laptop and a 4-cpu node can run
+      # the same image with different sizes.  Part 7 explains the values.
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-4}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
+      GUNICORN_MAX_REQUESTS: ${GUNICORN_MAX_REQUESTS:-5000}
+    healthcheck:
+      # Frappe maps the request Host to a site directory.  Probing the pod IP
+      # without a Host header returns 404, so the probe has to send the site
+      # name - the same trap in Kubernetes, where it is solved with
+      # httpGet.httpHeaders: [{name: Host, value: <site>}].
+      test: ["CMD-SHELL", "curl -sf -o /dev/null -H 'Host: ${SITE_NAME:-tenantbooks.localhost}' http://127.0.0.1:8000/api/method/ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1536m
+
+  frontend:
+    <<: *app
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      <<: *frappe_env
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${SITE_NAME:-tenantbooks.localhost}
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: "120"
+      CLIENT_MAX_BODY_SIZE: 50m
+    ports:
+      - "${WEB_PORT:-8081}:8080"
+    healthcheck:
+      # nginx -> gunicorn, from inside the box: proves proxy_pass, the site
+      # header and the /assets route without leaving the container.
+      test: ["CMD-SHELL", "curl -sf -o /dev/null http://127.0.0.1:8080/api/method/ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      frappe:
+        # Workers render PDFs by fetching http://<host_name>:<port>/assets/*;
+        # this alias makes that name resolve inside the network.  Without it,
+        # wkhtmltopdf fails with "ConnectionRefusedError" (found in Part 1).
+        aliases: [tenantbooks.localhost]
+    depends_on:
+      backend:
+        condition: service_started
+
+  websocket:
+    <<: *app
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  scheduler:
+    <<: *app
+    command: ["bench", "schedule"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  worker-short:
+    <<: *app
+    command: ["bench", "worker", "--queue", "short,default"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  worker-long:
+    <<: *app
+    command: ["bench", "worker", "--queue", "long"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ------------------------------------------------------------ demo peer
+  mock-receiver:
+    build:
+      context: ../mock-receiver
+    image: tenantbooks-mock-receiver:${CUSTOM_TAG:-v15.103.0}
+    networks: [frappe]
+    restart: unless-stopped
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET in docker/prod.env}
+      PORT: "8071"
+    ports:
+      - "${RECEIVER_PORT:-8072}:8071"
+
+volumes:
+  db-data:
+  redis-queue-data:
+  sites:
+  logs:
+
+networks:
+  frappe:
+    driver: bridge
