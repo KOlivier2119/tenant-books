@@ -49,7 +49,17 @@ spec:
               set -euo pipefail
               if [ ! -f /seed/apps.txt ]; then
                 echo "seeding empty PVC from the image's sites/ directory"
-                cp -a /home/frappe/frappe-bench/sites/. /seed/
+                # cp -R, NOT cp -a: -a also preserves ownership and timestamps,
+                # and a non-root user may not set the mtime of a directory it does
+                # not own.  The volume root belongs to root, so `cp -a` dies with
+                #   cp: preserving times for '/seed/.': Operation not permitted
+                # exit 1 - AFTER having copied most files, which makes the failure
+                # look like a half-seeded volume that the guard then skips.
+                # Copying as uid 1000 already gives the right result: every file
+                # lands as 1000:root inside a setgid group-writable directory.
+                cp -R /home/frappe/frappe-bench/sites/. /seed/
+                sync
+                [ -f /seed/apps.txt ] && [ -d /seed/assets ] && echo "seed verified"
               else
                 echo "PVC already seeded, skipping"
               fi
@@ -119,8 +129,16 @@ spec:
 
               # 3. app settings + the two values that make outbound PDF/webhook
               # work from inside a pod (see Part 1 bug 6 and Part 2 section 9).
-              bench --site "$SITE_NAME" set-config -g webhook_url "$WEBHOOK_URL"
-              bench --site "$SITE_NAME" set-config -g webhook_secret "$WEBHOOK_SECRET"
+              #
+              # NO -g here, and that is a multi-tenancy fix, not a style choice:
+              # -g writes into the bench-WIDE sites/common_site_config.json, which is
+              # shared by every site on the pod.  A per-tenant webhook secret written
+              # there means tenant A's HMAC key signs tenant B's deliveries, and one
+              # leaked volume file is a global key.  Site-level config is merged over
+              # the global one by frappe.conf, so the app reads the same key either
+              # way while each tenant keeps its own.
+              bench --site "$SITE_NAME" set-config webhook_url "$WEBHOOK_URL"
+              bench --site "$SITE_NAME" set-config webhook_secret "$WEBHOOK_SECRET"
               bench --site "$SITE_NAME" set-config host_name "$FRAPPE_HOST_NAME"
               bench --site "$SITE_NAME" set-config webserver_port "$FRAPPE_WEBSERVER_PORT"
 

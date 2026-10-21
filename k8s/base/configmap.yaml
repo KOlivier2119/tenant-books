@@ -21,8 +21,14 @@ data:
   # Written into {site}/site_config.json by the create-site Job.  Without it
   # every generated absolute URL (and wkhtmltopdf's PDF fetch) points at the
   # pod IP, which nothing else in the cluster can reach.
-  FRAPPE_HOST_NAME: http://tenantbooks.localhost:8080
-  FRAPPE_WEBSERVER_PORT: "8080"
+  #
+  # It must be the URL a *client* would use - the Ingress address, not a pod or
+  # Service port - because Frappe builds the print URL from it and then
+  # wkhtmltopdf fetches that URL from inside a worker pod.  Port 80 is the
+  # Ingress's port; the app server itself listens on 8000 and nginx on 8080, and
+  # changing this value does not move either of them.
+  FRAPPE_HOST_NAME: http://tenantbooks.localhost
+  FRAPPE_WEBSERVER_PORT: "80"
 
   # --- non-secret site config, read by the create-site Job ---
   WEBHOOK_URL: http://mock-receiver.tenantbooks.svc.cluster.local:8071/hook

@@ -105,6 +105,54 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
+  name: backend-ingress
+spec:
+  # The ingress side of `frontend-to-app`, and the second reproduction of the
+  # same trap: nginx was allowed to *send* to backend:8000, backend was still
+  # allowed to *receive* nothing, so every request died as a 502 / "connection
+  # refused" while both pods reported Ready.  Two details that make this worse
+  # than the database case: the Service has healthy endpoints (so
+  # `kubectl get ep` looks fine), and nginx reports the *ClusterIP* as the
+  # refused upstream, which points at kube-proxy rather than at a policy.
+  # The distinguishing test is a direct request to the pod IP from the client
+  # pod - if that fails while the endpoints list is populated, it is the policy:
+  #   kubectl -n tenantbooks exec deploy/frontend -- curl -s \
+  #     -H 'Host: tenantbooks.localhost' http://<backend-pod-ip>:8000/api/method/ping
+  podSelector:
+    matchLabels:
+      # both HTTP-serving frappe roles: gunicorn (8000) and socket.io (9000)
+      app: backend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: frappe-frontend
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: websocket-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: websocket
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: frappe-frontend
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
   name: frappe-to-db
 spec:
   podSelector:
@@ -167,6 +215,41 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frappe-to-ingress
+spec:
+  # The loop that only shows up once you run the thing: a worker renders an
+  # invoice PDF by fetching the site's own print URL (host_name).  That URL is the
+  # address clients use, so the request leaves the pod, goes through the Ingress
+  # controller and comes back in via the frontend.  With default-deny egress the
+  # first hop is dropped and wkhtmltopdf reports
+  # "Exit with code 1 due to network error: HostNotFoundError".
+  #
+  # 80 is the port the packet carries, 8000 the port the controller pod listens on
+  # (Service port 80 -> targetPort web/8000).  CNI implementations differ on
+  # whether egress policy is evaluated before or after the Service DNAT, so both
+  # are allowed instead of guessing; narrow it to one once you have measured which
+  # one your cluster actually matches on.
+  podSelector:
+    matchLabels:
+      tier: frappe
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8000
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

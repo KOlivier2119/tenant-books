@@ -51,6 +51,11 @@ spec:
             limits:
               cpu: "1"
               memory: 768Mi
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
       # No probes: see the reasoning in scheduler.yaml.  The signal that a
       # worker is unhealthy is queue backlog / job age (Part 5 alert), not
       # "is the process alive".
@@ -107,6 +112,11 @@ spec:
             limits:
               cpu: "2"
               memory: 1536Mi
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
       volumes:
         - name: sites
           persistentVolumeClaim:

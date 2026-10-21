@@ -5,9 +5,10 @@ roles, a MariaDB StatefulSet, two Redis, shared storage, bootstrap Jobs, autosca
 network policy and an Ingress. One `kubectl apply -k` and the whole stack exists.
 
 Verified on this machine's single-node **k3s 1.36.5** cluster (namespace `tenantbooks`).
-The data tier ran for real; the app tier is blocked on one root-only command (the
-cluster's container runtime cannot see images built by Docker) — see
-[Loading the image](#loading-the-image-into-the-cluster).
+The whole stack runs: both bootstrap Jobs complete, all seven Frappe roles are Ready, an
+Order submitted over REST through the Ingress produces a PDF on the shared volume and an
+HMAC-signed webhook the receiver accepts. How the image got into a cluster that cannot see
+Docker's store, without root, is [here](#11-loading-the-image-into-the-cluster).
 
 ```
 tenant-books/k8s/
@@ -96,8 +97,11 @@ Three things about this order that are easy to get wrong and are *measured* here
   ... (x34)
   ```
   After `kubectl apply -f k8s/base/namespace.yaml`, the same command returns
-  `created (server dry run)` for all 37 objects — i.e. the real API server, with its real
-  admission plugins and CRDs, accepted every document.
+  `created (server dry run)` for every object — 37 at that first measurement, 40 now
+  (14 NetworkPolicies among them) — i.e. the real API server, with its real admission
+  plugins and CRDs, accepted every document. The count is not decoration: a `kustomization.yaml`
+  that omits a file fails silently, so `kubectl kustomize | grep -c '^kind:'` is how you
+  notice.
 * **Kubernetes has no Job DAG.** `create-site` and `migrate` are two independent Jobs; the
   only ordering guarantee is the one in the commands above. Part 4's pipeline makes it
   explicit with `kubectl wait --for=condition=complete job/create-site` between steps.
@@ -278,20 +282,39 @@ Verified: the object is accepted and renders exactly as written on this cluster
 
 ```
 $ kubectl -n tenantbooks describe hpa backend
-Deployment pods:    0 current / 0 desired
   Scale Up:  Stabilization Window: 30 seconds ... Percent 100 / 30s
   Scale Down: Stabilization Window: 300 seconds ... Pods 1 / 120s
 ```
 
-`0 desired` with no target pods is the correct idle state. If metrics-server were missing
-this line reads `<unknown>` and the events say `unable to fetch metrics from resource
-metrics API` — the single most common reason an HPA "does nothing".
+If metrics-server were missing the target reads `<unknown>` and the events say `unable to
+fetch metrics from resource metrics API` — the single most common reason an HPA "does
+nothing". A second failure mode shows up in the events when the HPA is applied *before* its
+Deployment: `FailedGetScale  deployments.apps "backend" not found`, repeated until the
+target exists (measured: 140 of those events before the web tier came up).
+
+**Scaled in both directions, measured.** Rather than burn a laptop at 1.0 GB free generating
+real CPU, the target was lowered so the same controller logic would act:
+
+```bash
+# force a scale-up (the metric is utilization *of the request*, so 1 % is reachable)
+kubectl -n tenantbooks patch hpa backend --type=merge -p \
+  '{"spec":{"metrics":[{"type":"Resource","resource":{"name":"cpu","target":{"type":"Utilization","averageUtilization":1}}}]}}'
+kubectl -n tenantbooks get hpa backend -w
+# events: New size: 4; reason: cpu resource utilization (percentage of request) above target
+#         New size: 6; ...
+# then restore 70 and watch it walk back: 6 -> 5 -> 4 -> 3 -> 2, one pod per 120 s
+```
+
+Two notes from doing it: `target` requires `type: Utilization` explicitly (a merge patch
+without it is rejected with `must specify a metric target type`), and a `--type=merge` patch
+on `spec.metrics` *replaces the whole array* — list every metric you want to keep.
 
 ---
 
 ## 8. Network policy — `networkpolicy.yaml`
 
-Default-deny for the namespace (both directions), then ten targeted allows.
+Default-deny for the namespace (both directions), then thirteen targeted allows —
+fourteen `NetworkPolicy` documents in `kubectl get netpol`.
 
 **Deviation from the brief, deliberate:** the spec asked for "a policy that allows only
 the web pods to reach MariaDB". Literally applied, that breaks the application — in
@@ -304,16 +327,24 @@ without rewriting the file.
 
 The set: `default-deny`, `allow-dns-egress`, `allow-ingress-to-frontend`,
 `frontend-to-app` (backend:8000, websocket:9000), `frappe-to-db`, `frappe-to-redis`,
-`frappe-to-frontend`, `frappe-to-webhook-receiver` (+ the commented production shape with
-`ipBlock: 0.0.0.0/0 except 10/8, 100.64/10, 172.16/12, 192.168/16` on 443), and matching
-ingress sides `db-ingress`, `redis-ingress`, `receiver-ingress`.
+`frappe-to-frontend`, `frappe-to-ingress`, `frappe-to-webhook-receiver` (+ the commented
+production shape with `ipBlock: 0.0.0.0/0 except 10/8, 100.64/10, 172.16/12,
+192.168/16` on 443), and the matching ingress sides `db-ingress`, `redis-ingress`,
+`receiver-ingress`, `backend-ingress`, `websocket-ingress`.
 
-Two rules are only obvious if the app has already failed once:
+Four rules are only obvious if the app has already failed once:
 
+* `backend-ingress` / `websocket-ingress` — with default-deny *ingress*, a Service can be
+  full of Ready endpoints and still refuse every connection. nginx reported
+  `connect() failed (111: Connection refused) while connecting to upstream` and the browser
+  got a 502, while `kubectl get pods` looked perfect.
 * `frappe-to-frontend` — the long worker renders a PDF with wkhtmltopdf, which fetches
-  `/assets/*` from the site URL (`host_name`). Inside a cluster that URL resolves to the
-  frontend Service, so a worker that cannot talk to nginx produces a truncated or failed
-  PDF. Same failure as Part 1's bug 6, re-derivable from the policy file.
+  `/assets/*` from the site URL (`host_name`). A worker that cannot reach nginx produces a
+  truncated or failed PDF. Same failure as Part 1's bug 6, re-derivable from the policy file.
+* `frappe-to-ingress` — the app fetches **its own public URL** to print an invoice, so the
+  request goes pod → Ingress controller → frontend → gunicorn. Without this allow,
+  wkhtmltopdf says `Exit with code 1 due to network error: HostNotFoundError` even though
+  the name resolves fine. See §9 for the second half of that story.
 * `allow-dns-egress` — without it `db` never resolves and every client fails with a DNS
   timeout that is indistinguishable from a refused connection.
 
@@ -370,6 +401,35 @@ kubectl apply -f k8s/tls/issuer.yaml      # staging issuer first: production rat
 Staging before production, because Let's Encrypt limits a domain to five blocked
 registrations a week and a typo in an annotation burns that budget silently.
 
+### `host_name` is a routing decision, not a cosmetic one
+
+Frappe builds every absolute URL — print links, email links, the URL wkhtmltopdf is told to
+fetch — from the site's `host_name`. Three separate failures hide in that one value, all
+measured here:
+
+1. **Port.** `host_name` must carry the port a *client* uses (the Ingress, 80), not the port
+   gunicorn listens on (8000) or the one nginx listens on (8080). Changing it moves nothing;
+   gunicorn binds `${GUNICORN_BIND}`. The `webserver_port` in `site_config.json` is likewise
+   only used to build URLs.
+2. **DNS.** `tenantbooks.localhost` is not a name any resolver knows. Inside a pod, the PDF
+   job failed with `HostNotFoundError` until the pod could resolve it — in the compose stack
+   the frontend's network alias did that for free, in Kubernetes it is `hostAliases`, which
+   lives in the laptop overlay only (`k8s/overlay-local-registry/host-aliases.yaml`). On a
+   real cluster with a real domain, DNS already does it and the patch should be deleted.
+3. **Which address to alias to.** Counter-intuitively, alias the name to the Ingress
+   controller's **ClusterIP**, not to the `LoadBalancer` address the browser uses. Measured
+   from a `tier: frappe` pod, same `Host` header: `http://10.43.178.99/` → 200,
+   `http://192.168.1.157/` → connection refused. The VIP is an ordinary pod-to-pod hop that
+   the `frappe-to-ingress` selector can match; the LB address is a hostPort hop into k3s's
+   `svclb` pod, whose IP matches no Traefik selector, so default-deny eats it. Widening the
+   policy to a whole subnet to "fix" that is the wrong lesson.
+
+And one trap while debugging it: **`curl` inside the pod lies.** Even with the right
+`/etc/hosts` line, `curl http://tenantbooks.localhost/` reported `Trying 127.0.0.1:80` (curl
+special-cases the `.localhost` suffix), while `getent hosts` and Python's `getaddrinfo` —
+what the application actually uses — returned the correct IP and got a 200. Debug name
+resolution with the interpreter your app runs on, not with curl.
+
 ---
 
 ## 10. Rolling updates and rollback
@@ -403,7 +463,7 @@ kubectl -n tenantbooks get rs -o wide          # which ReplicaSet, which image
 kubectl -n tenantbooks describe deploy/backend | grep -A3 Image
 ```
 
-Three rollback facts that are not obvious until they bite:
+Three rollback facts that are not obvious until they bite, plus two measured in the drill:
 
 * **`rollout undo` only helps if the previous template points at an image that still
   exists unchanged.** A `:latest` or `:main` tag means "undo" rolls forward into the same
@@ -414,6 +474,23 @@ Three rollback facts that are not obvious until they bite:
   schema migration is not a `kubectl` operation at all — that is Part 6's
   expand/contract rule (never drop a column in the migration that breaks the previous
   release, so the old code can run against the new schema).
+* **`rollout history` is useless until you label the revisions.** Every revision prints
+  `CHANGE-CAUSE <none>` unless something writes
+  `kubernetes.io/change-cause: "..."` into the pod template annotations at deploy time —
+  one line in the CI job, and it is what makes `--to-revision=2` a decision instead of a
+  guess.
+* **An undo is a new revision, not a time machine.** Measured: rev 4 (`backend-56f47888f9`,
+  one annotation added) → `rollout undo` → the *old* ReplicaSet `backend-d5bb4dcf8` came back
+  with `desired=2 ready=2` carrying **revision 5**, rev 4 went to 0, and
+  `/api/method/ping` through the Ingress returned 200 the whole way. `maxUnavailable: 0`
+  held: `rollout status` reported success with no window where available fell below desired.
+* **After an undo, re-apply the file.** kubectl warns verbatim: *"Rolling back will not
+  update the `kubectl.kubernetes.io/last-applied-configuration` annotation, which may cause
+  unexpected behavior on future `kubectl apply` operations."* The live template and the
+  recorded "last applied" config now disagree, so the next apply of the *same* manifest can
+  be a silent no-op. `kubectl kustomize … | kubectl apply -f -` puts the cluster back under
+  file management.
+
 * **A StatefulSet whose new template fails its probe deadlocks the rollout** and prints
   `Waiting for 1 pods to be ready` forever. Measured here: after fixing the broken startup
   probe in `mariadb.yaml`, the StatefulSet spec showed the new probe
@@ -428,23 +505,45 @@ Three rollback facts that are not obvious until they bite:
 
 k3s runs its own containerd, separate from Docker's, so an image built locally is
 invisible to it — the pods fail with `ImagePullBackOff: ... docker.io/library/tenantbooks`
-because there is no such public repository. Two ways to fix it:
+because there is no such public repository. Three ways to fix it, in the order I tried them:
 
-**A. Import the tarball (used here, needs root):**
+**A. Import the tarball — needs root, was unavailable here:**
 
 ```bash
 docker save -o /tmp/tenantbooks.tar tenantbooks:v15.103.0     # 692 MB, done on this machine
 sudo k3s ctr images import /tmp/tenantbooks.tar
 sudo k3s ctr images ls | grep tenantbooks    # expect: docker.io/library/tenantbooks:v15.103.0
-                         # (not run here: importing needs root)
 ```
 
-`imagePullPolicy: IfNotPresent` then makes the local copy authoritative and nothing goes
-over the network. (Docker Desktop on macOS hides this entirely — its Kubernetes shares
-the image store — and `kind` has `kind load docker-image`. k3s/minikube-with-containerd
-need the explicit import.)
+`sudo: a password is required` on this machine and the containerd socket is root-only, so
+this path is documented but not the one used. (Docker Desktop on macOS hides the whole
+problem — its Kubernetes shares the image store — and `kind` has `kind load docker-image`.)
 
-**B. Push to a registry and use the overlay** (the CI path, Part 4):
+**B. A registry on `localhost` — what actually unblocked the deploy, no root needed:**
+
+```bash
+docker run -d --name tb-registry -p 5000:5000 registry:2
+docker tag  tenantbooks:v15.103.0                 localhost:5000/tenantbooks:v15.103.0
+docker tag  tenantbooks-mock-receiver:v15.103.0   localhost:5000/tenantbooks-mock-receiver:v15.103.0
+docker push localhost:5000/tenantbooks:v15.103.0
+docker push localhost:5000/tenantbooks-mock-receiver:v15.103.0
+kubectl apply -k k8s/overlay-local-registry
+```
+
+Measured: `Successfully pulled ... in 1m1.775s (725302221 bytes)` and `bench --version`
+inside the pod → `frappe 15.103.0, tenantbooks 0.0.1`.
+
+No daemon or kubelet configuration is involved, because both clients make the same exception
+for a registry named `localhost`: Docker pushes over plain HTTP and k3s's containerd pulls
+over plain HTTP. A registry reachable under any *other* name needs `insecure-registries` in
+`/etc/docker/daemon.json` **and** a `registries.yaml` on the k3s node — both root-owned files.
+That is the entire reason this overlay exists.
+
+The one trap: `imagePullPolicy: IfNotPresent` means a re-pushed content under the **same tag**
+is never re-fetched by a node that already has it, so a `rollout restart` silently runs the old
+bytes. Push a new tag every time (in CI, the git SHA).
+
+**C. Push to a real registry and use the other overlay** (the CI path, Part 4):
 
 ```bash
 docker tag tenantbooks:v15.103.0 ghcr.io/<you>/tenantbooks:v15.103.0
@@ -454,11 +553,14 @@ kubectl -n tenantbooks create secret docker-registry ghcr --docker-server=ghcr.i
 kubectl apply -k k8s/overlay-registry
 ```
 
-The overlay rewrites the image name inside the base manifests at build time, so all seven
-workloads change together and no per-environment copy of a Deployment file is needed. With
-a registry reference, `imagePullPolicy: IfNotPresent` is right only when the image is
-pinned by **digest**; with a mutable tag you want `Always`, otherwise a node that already
-has `:v15.103.0` never re-pulls a re-pushed content under the same name.
+Each overlay rewrites the image *name* inside the base manifests at build time, so all seven
+workloads change together and no per-environment copy of a Deployment file exists. With a
+registry reference, `IfNotPresent` is right only when the image is pinned by **digest**; with a
+mutable tag you want `Always`.
+
+**One more laptop-only thing the overlay does:** `host-aliases.yaml` adds an `/etc/hosts` entry
+for `tenantbooks.localhost` to every `tier=frappe` pod. See §9 — without it, PDF rendering
+fails, because `host_name` is a hostname that only DNS outside the cluster knows.
 
 ---
 
@@ -466,61 +568,49 @@ has `:v15.103.0` never re-pulls a re-pushed content under the same name.
 
 | Claim | Evidence (all from this machine) |
 | --- | --- |
-| 37 objects render into a valid manifest set | `kubectl kustomize k8s/base` → 37 documents, exit 0 |
-| The API server accepts every one of them | `kubectl apply -k k8s/base --dry-run=server` → 37 × `created (server dry run)`, zero errors (namespace created first, see §2) |
-| Namespace prerequisite is real | same command without the Namespace → one `Error from server (NotFound)` per object (34 at the time of measurement) |
-| MariaDB comes up Ready with exec probes | `db-0 1/1 Running`; `healthcheck.sh --connect --innodb_initialized` returns 0 inside the container |
+| Objects render and the API server accepts them | `kubectl kustomize` → clean build; `kubectl apply` → every object `created/configured`, zero errors (namespace first, see §2) |
+| MariaDB Ready with exec probes, survives a template change | `db-0 1/1 Running`; `healthcheck.sh --connect --innodb_initialized` exits 0 in-container; STS re-created the pod and the volume re-attached (`partitioned roll out complete`) |
 | Redis both instances Ready | `redis-cache-… 1/1`, `redis-queue-0 1/1` |
-| PVCs provision on first consumer | events `WaitForFirstConsumer` → 4 PVs bound, `[ReadWriteOnce]`, `kubectl get pv` |
+| PVCs provision on first consumer | events `WaitForFirstConsumer` → PVs bound `[ReadWriteOnce]` |
 | Non-root can write the shared volume | probe pod: `uid=1000 gid=0(root)`, `drwxrwsrwx /sites`, `WRITE_OK` |
-| NetworkPolicy actually blocks | §8 table: labelled pod `open` in 0.1–0.2 s, unlabelled pod no response |
-| HPA accepted with behavior section | `describe hpa backend`: windows/policies echoed back, `0 current / 0 desired` |
-| Headless Service hides a NotReady db | while `db-0 0/1`: `nc: bad address 'db'`; once Ready: `db (10.42.0.18:3306) open` |
-| Broken probe deadlocks a STS rollout | `sts` spec had the new probe, pod ran the old one until `delete pod db-0` |
-| Metrics-server present (so CPU HPA is meaningful) | `kubectl top nodes` → `fedora 1481m 12% 2373Mi 31%` |
-
-Not run as a pod (blocked on §11 A/B): the seven frappe workloads reaching Ready, the
-create-site Job against the in-cluster MariaDB, a PDF delivered through the receiver, and
-`rollout undo` exercised end to end. All four are the *next* commands in §13; nothing about
-them is cluster-specific except the image load.
+| Image loads without root | §11 B, `Successfully pulled ... 1m1.775s` |
+| Bootstrap Jobs work against the in-cluster DB | `job/create-site 0/1 Completed`, log ends `create-site done`; `job/migrate Completed` |
+| Site is real, data is real | `seed.seed` → `{"customers": 2,"products": 3}` |
+| REST call through the **Ingress** creates an Order + Invoice | `POST /api/v2/method/tenantbooks.billing.api.create_order` → `HTTP=200 t=0.99s`, `{"name":"TB-ORD-2026-0002","net_total":42.5,"invoice":"TB-INV-2026-00002"}` |
+| The long worker picks up site-scoped jobs | `home-frappe-frappe-bench:long: Job OK (tenantbooks.localhost::tenantbooks-pdf-TB-INV-2026-00002)` — the queue name is bench-scoped, the *job id* carries the site, so one worker set serves every tenant |
+| PDF rendered and written to the shared volume | `sites/tenantbooks.localhost/public/files/TB-INV-2026-00002.pdf`, 16974 bytes |
+| …and served back over HTTP by a *different* pod | `GET /files/TB-INV-2026-00002.pdf` through the Ingress → `200`, 16974 bytes, `file` → `PDF document, version 1.4, 1 page` |
+| HMAC webhook delivered and verified | receiver: `ACCEPTED invoice.submitted invoice=TB-INV-2026-00002` from `10.42.0.70` (the worker pod), and a bad signature is rejected with 401 by the same code path |
+| retry + back-off **driven by the scheduler pod** | URL pointed at `?fail=1` -> receiver `REJECTED forced failure`, row `Retrying / 500 / attempts=1 / next_retry_at=+69 s`; URL restored; the `*/5 * * * *` sweep re-enqueued it and the receiver logged `ACCEPTED ... TB-INV-2026-00003`, row now `Sent / 200 / attempts=2 / next_retry_at=null` |
+| an unknown tenant key is a clean error, not a crash | `create_order` with `customer: "Riverside Press"` -> `{"errors":[{"type":"DoesNotExistError", ...}]}`, **no Order created** |
+| Scheduler pod really runs cron events | `tabScheduled Job Type`: `tasks.retry_pending_webhooks`, `cron */5 * * * *`, `stopped 0`, `last_execution` set today; `get_scheduler_status` → `{"status": "active"}` |
+| NetworkPolicy blocks and allows | §8 matrix, 14 policies; the deny rows were each turned into an allow-and-retry (502 → 200 for the app tier, `HostNotFoundError` → `Job OK` for the PDF loop) |
+| HPA scales **up** and reads the metric | target lowered -> `SuccessfulRescale  New size: 4`, then `New size: 6`; `kubectl top pods` returns per-pod CPU |
+| HPA scales **back down** on its own | target restored to 70 % -> 6 → 5 → 4 → 3 → 2 over ~5 min, obeying `stabilizationWindowSeconds: 300` and `scaleDown: 1 pod per 120 s` |
+| Rolling update with `maxUnavailable: 0` | every template change: `deployment "backend" successfully rolled out`, no window with `available < desired` |
+| Rollback works and is observable | rev 4 → `rollout undo` → old RS `backend-d5bb4dcf8` back at `desired=2 ready=2` as **rev 5**, rev 4 scaled to 0, `/api/method/ping` 200 throughout (§10) |
 
 ## 13. Not verified, and how to verify it
 
-Run these in order after loading the image (§11); each has a concrete expected answer.
+What is left needs a second node, a public hostname, or real load:
 
 ```bash
-kubectl apply -k k8s/base
-kubectl -n tenantbooks wait --for=condition=Complete --timeout=15m job/create-site
-kubectl -n tenantbooks logs job/create-site | tail -5     # expect "create-site done"
-kubectl -n tenantbooks rollout status deploy/backend      # expect 2/2 available
-curl -s http://localhost:8080/api/method/ping -H 'Host: tenantbooks.localhost'   # {"message":"pong"}
+# reproduce the webhook retry path (verified once, §12) - note that a later
+# `kubectl apply` of the overlay reverts the ConfigMap, so re-run only the Job:
+kubectl -n tenantbooks patch configmap tenantbooks-env --type=merge \
+  -p '{"data":{"WEBHOOK_URL":"http://mock-receiver.tenantbooks.svc.cluster.local:8071/hook?fail=1"}}'
+kubectl -n tenantbooks delete job create-site --wait=true
+kubectl -n tenantbooks create -f /tmp/create-site-job.yaml      # extracted from the overlay
+kubectl -n tenantbooks wait --for=condition=Complete --timeout=4m job/create-site
+# submit an invoice, watch: receiver logs REJECTED, row goes Retrying/500/attempts=1
+# then restore the URL, re-run the Job the same way, and the */5 sweep sends it
+kubectl -n tenantbooks logs deploy/mock-receiver | grep -E "ACCEPTED|REJECTED"
 
-# the app tier is genuinely functional, not just Ready:
-kubectl -n tenantbooks exec deploy/worker-long -- bench --site tenantbooks.localhost \
-  execute tenantbooks.billing.seed.seed                  # {"customers":2,"products":3}
-KEY=$(kubectl -n tenantbooks exec deploy/backend -- bench --site tenantbooks.localhost \
-  execute frappe.core.doctype.user.user.generate_keys --args '["Administrator"]')
-# then POST create_order as in the README and watch:
-kubectl -n tenantbooks logs -l app=worker-long --tail=20  # "Job OK (...webhook...)"
-kubectl -n tenantbooks logs deploy/mock-receiver --tail=5 # "ACCEPTED invoice.submitted ..."
-
-# probes are what you think they are
-kubectl -n tenantbooks describe pod -l app=backend | grep -A2 'Startup\|Ready'
-
-# autoscaling really moves
+# the realistic autoscaling test - generate load instead of lowering the target.
+# Not done here: the laptop had ~1.0 GB free, so §12 lowered the target instead.
 kubectl -n tenantbooks run load --image=busybox:1.36 --restart=Never -- \
   sh -c 'for i in $(seq 1 300); do wget -q -O /dev/null http://backend:8000/api/method/ping --header="Host: tenantbooks.localhost" || true; done'
-kubectl -n tenantbooks get hpa backend -w          # TARGETS -> above 70%, replicas climb
-
-# rollback path
-kubectl -n tenantbooks rollout history deploy/backend
-kubectl -n tenantbooks rollout undo deploy/backend && kubectl -n tenantbooks rollout status deploy/backend
-
-# NetworkPolicy narrowed correctly for the receiver, once it exists
-kubectl -n tenantbooks exec deploy/mock-receiver -- wget -qO- http://localhost:8071/  # {"status":"ok",...}
 ```
-
-Still unverified beyond those commands, and labelled as such in the README:
 
 * **cert-manager TLS** — the manifests are schema-valid (`kubectl --dry-run=server` on a
   cluster where the CRDs exist would be needed to prove even that); no certificate was
@@ -530,13 +620,11 @@ Still unverified beyond those commands, and labelled as such in the README:
 * **Arbitrary-uid execution** (OpenShift-style) — the image is `g=u`-chmodded and group-0
   for that reason, but no `securityContext: {runAsUser: 10001}` pod was started here.
 * **True multi-tenancy.** Each tenant is a site with its own database; this stack runs one
-  site. The Host-header routing seam is in `ingress.yaml` and the ConfigMap, but
-  per-tenant rate limiting, a second site, and shared-schema row isolation are not.
+  site. The Host-header routing seam is in `ingress.yaml` and the ConfigMap, and the queue
+  naming in §12 shows one worker set *can* serve several sites, but per-tenant rate limiting,
+  a second site, and shared-schema row isolation are not implemented.
 * **Resource sizing.** The requests in §6 are chosen so the stack schedules on a 7.5 GB
-  laptop; none of them were measured against a load profile. `kubectl top pods` during the
-  load test above is how you would start.
-* **HPA at work**: metrics-server is present and the object parses, but with no backend
-  pods the desired count stayed `0`; no scale-up event was observed.
+  laptop; `kubectl top pods` during the load test above is how you would start.
 
 ---
 
@@ -666,3 +754,58 @@ kubectl -n tenantbooks auth can-i --list --as=system:serviceaccount:tenantbooks:
 8. **`fsGroup` is not a cosmetic field here**: without `fsGroup: 0`, uid 1000 cannot write
    the freshly provisioned `sites` volume, and the failure appears as `PermissionError`
    from inside `bench new-site` rather than as anything about storage.
+9. **`volumes:` without `volumeMounts:` is valid YAML that silently does nothing.** The
+   scheduler and both workers declared the pod-level volumes but never mounted them, so
+   they read the image's empty `sites/` — `cat sites/common_site_config.json` → `{}` — and
+   every job died with `redis.exceptions.ConnectionError: Error 111 connecting to
+   127.0.0.1:11311`. The pod stayed `1/1 Running` while doing nothing. To see it: patch the
+   Deployment to `command: ["sleep","infinity"]`, exec in, and look at the filesystem.
+10. **`cp -a` fails on a Kubernetes volume as non-root.** Preserving mtimes on a volume whose
+    root directory belongs to `root` gives `cp: preserving times for '/seed/': Operation not
+    permitted` — *after* most files were copied, so the initContainer exited 1 having done
+    90 % of the work. The seed uses `cp -R` plus `sync` and then asserts a marker file
+    exists, so a partial copy cannot masquerade as completion.
+11. **Deleting the PVC does not delete the site.** Frappe keeps state in two places: the
+    `sites/<name>/` directory *and* a real MariaDB database plus a generated DB user. After a
+    volume wipe, `bench new-site` failed with `Database _f471a2d288e811b8 already exists`, and
+    fixing that produced `(1045, "Access denied for user '_f471a2d288e811b8'@'10.42.0.33'")`.
+    A true reset is `DROP DATABASE` + `DROP USER` for the orphan as well.
+12. **Jobs are immutable and there is no DAG.** Applying `migrate` in the same pass as
+    `create-site` made it fail instantly (the site did not exist yet); re-running a finished
+    Job needs `kubectl delete job` first — `apply` refuses to change a template. The bootstrap
+    is therefore *two* sequential applies, and the `wait-for-db` initContainer is what keeps
+    each one honest on its own.
+13. **A kustomize `patches:` entry with a `target:` selector still needs TypeMeta** in this
+    kubectl (1.36): a bare `spec:` fragment fails with `unable to parse SM or JSON patch`. Add
+    `apiVersion: apps/v1`, `kind: Deployment`, and a throwaway `metadata.name` — the name is
+    ignored when `target:` is present.
+14. **`bench console` is interactive IPython; piping a script into it executes nothing**
+    (`Do you really want to exit ([y]/n)?`). Use `bench execute`, which *does* commit — it ends
+    with `if frappe.db: frappe.db.commit()` — so Part 1's "no auto-commit" warning applies to
+    the console only. Bare `env/bin/python` is not a third option: its log handlers resolve to
+    `/home/frappe/logs`, a directory the image does not have
+    (`FileNotFoundError: /home/frappe/logs/database.log`), and exporting `FRAPPE_BENCH_ROOT`
+    — which `get_bench_path()` does honour — did not change it. Not chased further: use
+    `bench execute`.
+15. **`kubectl wait --for=condition=Ready pod --all` never returns** in a namespace with
+    completed Jobs: a finished Job pod is `Completed`, not `Ready`, so the command blocks
+    until its own timeout. Wait per workload (`rollout status deploy/…`) or on the
+    `job` condition instead.
+16. **Do not judge the scheduler from the job table's `name` column.** In v15 a
+    `Scheduled Job Type` row is named after the *short* method (`tasks.retry_pending_webhooks`),
+    not the dotted path, so `where name like '%tenantbooks%'` returns nothing and looks like a
+    missing registration. Filter on `method`. The `create_type` column from older Frappe is
+    gone too, and `last_execution` is stored in the site's time zone while the pod logs print
+    UTC — six hours apart here — so line the clocks up before concluding an event never ran.
+17. **`kubectl apply` prints `configured` for a StatefulSet even when nothing changed.** The
+    server defaults fields the file omits (`podManagementPolicy`, `revisionHistoryLimit`,
+    `restartPolicy`, `dnsPolicy`, `persistentVolumeClaimRetentionPolicy`, plus `apiVersion` and
+    `kind` inside each `volumeClaimTemplates` entry), so apply always finds a patch to send.
+    `db-0` kept `AGE 104m` through three such applies — which is how you tell cosmetic churn
+    from a real rollout: read the pod's age, not the word `configured`.
+18. **A `kubectl patch` on a ConfigMap survives exactly until the next `kubectl apply`.** The
+    retry test patched `WEBHOOK_URL` to the failing endpoint, then applied the overlay to
+    re-run the bootstrap Job — the apply rewrote the ConfigMap from the file and the injected
+    fault vanished with no error anywhere. Under GitOps the file *is* the state, so an
+    experiment must re-create only the object it needs (`kubectl create -f` a single Job
+    extracted from the rendered overlay), never `apply -k` the whole stack.

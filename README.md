@@ -70,10 +70,10 @@ Image facts, all measured (details and commands in `docs/part2-docker.md` §9):
 | the whole Part 1 flow still works from the image | REST `create_order` -> `TB-ORD-2026-0001` / `TB-INV-2026-00001`; worker-long `Job OK` for `tenantbooks-pdf-…` and `tenantbooks-webhook-…`; receiver logged `ACCEPTED invoice.submitted`; delivery log `Sent / attempts 1 / 200`; `/files/TB-INV-2026-00001.pdf` -> 200 `application/pdf` 16,917 B |
 | prod refuses to run tests | `bench run-tests` -> "You can enable tests by ... set-config allow_tests true" |
 
-## Part 3 status: Kubernetes (manifests verified on k3s; app tier pending one root command)
+## Part 3 status: Kubernetes — the whole stack runs on k3s
 
 ```
-k8s/base/kustomization.yaml     # 37 objects, one apply
+k8s/base/kustomization.yaml     # 40 objects, one apply
 k8s/base/configmap.yaml         # non-secret env for all 7 frappe roles
 k8s/base/secret.example.yaml    # -> secret.yaml (git-ignored; kustomize fails without it)
 k8s/base/pvc.yaml               # sites + logs, the shared Frappe filesystem
@@ -82,17 +82,28 @@ k8s/base/redis.yaml             # redis-cache (Deployment) + redis-queue (Statef
 k8s/base/jobs.yaml              # create-site, migrate  (+ the PVC-seeding initContainer)
 k8s/base/{backend,frontend,websocket,scheduler,workers}.yaml   # the 7 roles, 1 image
 k8s/base/hpa.yaml               # autoscaling/v2, CPU 70%, 2-6 replicas, asymmetric behavior
-k8s/base/networkpolicy.yaml     # default-deny + 10 allows (both directions, see docs)
+k8s/base/networkpolicy.yaml     # default-deny + 13 allows (both directions, see docs)
 k8s/base/ingress.yaml           # traefik now, cert-manager TLS block commented
 k8s/tls/issuer.yaml             # ClusterIssuers, kept out of base on purpose
+k8s/overlay-local-registry/     # same manifests + hostAliases, image from localhost:5000
 k8s/overlay-registry/           # same manifests, image from ghcr.io (the CI path)
 ```
 
 ```bash
 cp k8s/base/secret.example.yaml k8s/base/secret.yaml    # 3 values; kustomize refuses without it
 kubectl apply -f k8s/base/namespace.yaml                # Namespace first (see docs §2)
-kubectl apply -k k8s/base
+
+# get the image into k3s without root (docs §11): registry on localhost + overlay
+docker run -d --name tb-registry -p 5000:5000 registry:2
+docker tag tenantbooks:v15.103.0 localhost:5000/tenantbooks:v15.103.0 && docker push localhost:5000/tenantbooks:v15.103.0
+kubectl apply -k k8s/overlay-local-registry
 kubectl -n tenantbooks wait --for=condition=Complete --timeout=15m job/create-site
+# Kubernetes has no Job DAG: `migrate` races `create-site` and fails first. Re-apply the
+# same overlay (via kustomize, so the image name is rewritten) and only the missing Job is
+# created:
+kubectl -n tenantbooks delete job --ignore-not-found migrate
+kubectl kustomize k8s/overlay-local-registry | kubectl apply -f -
+kubectl -n tenantbooks wait --for=condition=Complete --timeout=10m job/migrate
 ```
 
 Measured on this machine (k3s 1.36.5, single node, full transcript in
@@ -100,20 +111,32 @@ Measured on this machine (k3s 1.36.5, single node, full transcript in
 
 | Claim | Evidence |
 | --- | --- |
-| every manifest is schema- and admission-valid | `kubectl kustomize k8s/base` -> 37 docs; `kubectl apply -k k8s/base --dry-run=server` -> 37 x `created (server dry run)`, zero errors |
-| the data tier really runs | `db-0 1/1`, `redis-cache 1/1`, `redis-queue-0 1/1` with exec/tcpSocket probes passing |
-| non-root can write the shared volume | probe pod with `runAsUser: 1000, runAsGroup: 0, fsGroup: 0`: `drwxrwsrwx /sites`, `WRITE_OK` |
-| NetworkPolicy blocks, not just parses | `tier=frappe` pod: `db (10.42.0.18:3306) open` in 0.2 s; unlabelled pod: no response (dropped) on `db`, `redis-cache`, `redis-queue` |
-| HPA accepted with its behavior section | `describe hpa backend` echoes 30 s/300 s windows and `0 current / 0 desired` |
-| the image is the only missing piece for the app tier | k3s runs its own containerd: `docker save -o /tmp/tenantbooks.tar` done (692 MB); `sudo k3s ctr images import /tmp/tenantbooks.tar` needs root |
+| every manifest is schema- and admission-valid, and really runs | `kubectl apply -k` -> every object `created/configured`; all 10 workloads `1/1` |
+| image loads into k3s with no root | `localhost:5000` push/pull over plain HTTP: `Successfully pulled ... in 1m1.775s (725 MB)` |
+| the bootstrap Jobs work against the in-cluster DB | `job/create-site Completed` (`create-site done`), `job/migrate Completed`, seed -> `{"customers": 2,"products": 3}` |
+| REST through the Ingress creates real documents | `POST .../create_order` -> `HTTP 200` in 0.99 s, `TB-ORD-2026-0002` + `TB-INV-2026-00002` |
+| the long queue serves site-scoped jobs | `home-frappe-frappe-bench:long: Job OK (tenantbooks.localhost::tenantbooks-pdf-TB-INV-2026-00002)` |
+| PDF lands on the shared volume and is served back | 16,974 B in `sites/tenantbooks.localhost/public/files/`, `GET /files/...pdf` -> `200`, `PDF document, version 1.4, 1 page(s)` |
+| HMAC webhook delivered and verified across the namespace | receiver `ACCEPTED invoice.submitted invoice=TB-INV-2026-00002` from the worker pod IP |
+| failed delivery retried **by the scheduler pod** | `?fail=1` -> `REJECTED forced failure` + row `Retrying / 500 / attempts=1 / next_retry_at +69 s`; URL restored; the `*/5` sweep re-sent it -> `ACCEPTED`, row now `Sent / 200 / attempts=2` |
+| the scheduler pod runs cron events | `tabScheduled Job Type`: `*/5 * * * *` row with `last_execution` today, `get_scheduler_status` -> `active` |
+| HPA really moves replicas | target lowered -> `SuccessfulRescale New size: 4`, then `6`; restored -> walked back down |
+| NetworkPolicy blocks *and* the app still works | 14 policies; each denial became a measured fix: 502 -> 200 (missing `backend-ingress`), `HostNotFoundError` -> `Job OK` (missing `frappe-to-ingress`) |
+| rolling update with `maxUnavailable: 0` | every template change: `deployment "backend" successfully rolled out`, no window with `available < desired` |
 
-Four real bugs were caught by running the manifests rather than writing them (docs §15):
+Thirteen real bugs were caught by running the manifests rather than writing them (the numbered
+list at the bottom of this file, items 12-24; docs §15 has the same set with the commands):
 a Kubernetes PVC is **not** pre-populated from the image the way a Docker named volume is
-(so `apps.txt` and `/sites/assets` were missing -> seeding initContainer); a NetworkPolicy
-egress allow with no matching ingress allow is a silent timeout; `mysqladmin` does not
-exist in `mariadb:11.4` so the DB probe died on `command not found`; and a headless
-Service publishes no DNS record while its pod is NotReady, which makes a broken probe look
-like a DNS failure from every client.
+(so `apps.txt` and `/sites/assets` were missing -> seeding initContainer, which itself needs
+`cp -R` because uid 1000 cannot preserve mtimes); a NetworkPolicy egress allow with no
+matching ingress allow is a silent timeout; `mysqladmin` does not exist in `mariadb:11.4` so
+the DB probe died on `command not found`; a headless Service publishes no DNS record while its
+pod is NotReady, which makes a broken probe look like a DNS failure; `volumes:` without
+`volumeMounts:` leaves a worker `1/1 Running` while it talks to the image's empty `sites/`;
+deleting the PVC does not delete the site, because the database and its generated user live in
+MariaDB; the site's own `host_name` must resolve *inside* the cluster, and to the Ingress
+controller's ClusterIP rather than to the LoadBalancer address; `bench console` piped from a
+heredoc silently executes nothing.
 
 ## Quickstart (verified on Docker 29, Fedora 44)
 
@@ -200,8 +223,10 @@ docker compose -f docker/compose.local.yaml exec backend \
    `doc.flags.ignore_permissions` instead.
 4. YAML merge keys (`<<`) do not deep-merge: redeclaring `environment:` on a service
    dropped `PYTHONPATH` and the app became unimportable (`ModuleNotFoundError`).
-5. `bench execute generate_keys` did not persist: the console has no auto-commit, so
-   the API key/secret pair was never written. Fixed with `frappe.db.commit()`.
+5. `bench console` has no auto-commit, so the API key/secret pair generated there was
+   never written; `frappe.db.commit()` fixed it. (`bench execute` *does* commit - it ends
+   with `if frappe.db: frappe.db.commit()` - which is why this bit us only once we moved
+   the same code into a piped console session.)
 6. wkhtmltopdf refused to build the PDF until the worker could resolve the site URL -
    hence the `tenantbooks.localhost` network alias on the frontend plus
    `host_name` / `webserver_port` in site config.
@@ -240,6 +265,46 @@ docker compose -f docker/compose.local.yaml exec backend \
     looking error for a probe problem. Related: a StatefulSet whose new template fails
     its probe deadlocks the rollout (`Waiting for 1 pods to be ready` forever) until
     `kubectl delete pod db-0`.
+16. (Part 3) `volumes:` without `volumeMounts:` is **valid YAML that does nothing**: the
+    scheduler and both workers kept `1/1 Running` while reading the image's empty `sites/`
+    (`cat sites/common_site_config.json` -> `{}`) and died on `Error 111 connecting to
+    127.0.0.1:11311`. Nothing about the pod looks wrong; you have to look at the filesystem.
+17. (Part 3) **`cp -a` fails on a PVC as uid 1000** - `preserving times for '/seed/':
+    Operation not permitted`, exit 1, *after* copying nearly everything. `cp -R` + `sync` +
+    an assertion on a marker file, so a partial copy cannot pass as seeded.
+18. (Part 3) **deleting the volume does not delete the site.** Frappe's state has two homes:
+    `sites/<name>/` on the PVC *and* a real database plus a generated MariaDB user. After a
+    wipe: `Database _f471a2d288e811b8 already exists`, and once that is dropped,
+    `(1045, "Access denied for user '_f471a2d288e811b8'@'10.42.0.33'")`.
+19. (Part 3) default-deny **ingress** starved the app tier while it looked healthy: nginx
+    logged `connect() failed (111: Connection refused) while connecting to upstream` and
+    users got 502, with `backend 2/2` and populated Endpoints. `backend-ingress` and
+    `websocket-ingress` were the missing pair.
+20. (Part 3) the site's `host_name` has to work **from inside a pod**, and the details are
+    not intuitive: the port is the Ingress's (80), not gunicorn's (8000) or nginx's (8080);
+    the name needs `hostAliases` because `.localhost` is not DNS; and the alias must point at
+    the Ingress controller's **ClusterIP**, because the LoadBalancer address is a hostPort hop
+    into k3s's svclb pod that no `podSelector` rule can match. Measured from a worker pod with
+    the same Host header: ClusterIP -> 200, LB address -> refused. `curl` in the pod also
+    lies, resolving `*.localhost` to `127.0.0.1` regardless of `/etc/hosts` - verify with the
+    interpreter your app actually uses (`socket.getaddrinfo` -> the right IP, HTTP 200).
+21. (Part 3) a kustomize `patches:` entry with `target:`/`labelSelector` still needs
+    `apiVersion` + `kind` + a dummy `metadata.name` in the patch file (kubectl 1.36), or it
+    fails with `unable to parse SM or JSON patch`.
+22. (Part 3) **`bench console` piped from a heredoc runs nothing** - IPython reads stdin but
+    answers `Do you really want to exit ([y]/n)?`. `bench execute` is the scriptable door.
+    Related: `kubectl wait --for=condition=Ready pod --all` hangs forever in a namespace with
+    completed Jobs (a `Completed` pod is never `Ready`).
+23. (Part 3) in v15 a `Scheduled Job Type` row is named `tasks.retry_pending_webhooks`, not
+    the dotted path, so `where name like '%tenantbooks%'` looks like an unregistered event -
+    filter on `method`. The old `create_type` column is gone, and `last_execution` is in the
+    site's time zone while pod logs print UTC (six hours apart here).
+24. (Part 3) **a `kubectl patch` on a ConfigMap is one `kubectl apply` away from being
+    reverted.** Patched `WEBHOOK_URL` to the failing endpoint, then applied the overlay to
+    re-run the bootstrap Job - the apply restored the file's value and the test silently
+    passed nothing. GitOps truth: the file is the source of state, so an experiment has to
+    re-create *only* the object it needs (`kubectl create -f` a single extracted Job), not
+    `apply -k` the whole stack.
 
 ## Not verified yet
 
@@ -265,12 +330,7 @@ docker compose -f docker/compose.local.yaml exec backend \
 - (Part 2) **arbitrary uid at runtime**: the image is group-0 writable so a
   kubelet-assigned uid *should* work, but only uid 1000 was actually exercised
   here; `runAsUser`/`fsGroup` are tested in Part 3.
-- (Part 3) **the seven app pods on the cluster.** Manifests are accepted by the real
-  API server and the data tier runs, but k3s has its own containerd and importing the
-  local image needs root: `sudo k3s ctr images import /tmp/tenantbooks.tar` (the tar is
-  already saved, 692 MB). After that one command the remaining verification is listed in
-  `docs/part3-kubernetes.md` §13.
 - (Part 3) **cert-manager TLS**: the `tls:` block and `k8s/tls/issuer.yaml` are written
   but no certificate was issued here - HTTP-01 needs a publicly resolvable hostname.
-- (Part 3) **multi-node / RWX storage** and **HPA actually scaling**: both reasoned
-  about, neither observed (one node, one RWO provisioner, no backend pods running).
+- (Part 3) **multi-node / RWX storage**: reasoned about, not observed - one node, one RWO
+  provisioner. Everything in Part 3 runs on a single k3s node with `localhost:5000`.

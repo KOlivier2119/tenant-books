@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Same manifests as k8s/base, only the image *source* changes: pull from a
+# plain-HTTP registry on the laptop instead of requiring root to copy tarballs
+# into k3s's own containerd store.
+#
+#   docker run -d --name tb-registry -p 5000:5000 registry:2
+#   docker tag  tenantbooks:v15.103.0                 localhost:5000/tenantbooks:v15.103.0
+#   docker push localhost:5000/tenantbooks:v15.103.0
+#   kubectl apply -k k8s/overlay-local-registry
+#
+# Why this works without any host configuration: k3s's containerd treats a
+# registry whose name starts with `localhost` as insecure (plain HTTP), so no
+# registries.yaml and no CA trust is needed.  Docker's client makes the same
+# exception for localhost:5000, which is why the push above needs no
+# insecure-registries entry in /etc/docker/daemon.json either.  A registry on a
+# *different* host would need both.
+#
+# The catch to remember when iterating: `imagePullPolicy: IfNotPresent` means a
+# re-pushed content under the SAME tag is never re-fetched by a node that
+# already has it.  Rollout restart would reuse the old bytes.  Push a new tag
+# (in production, the git SHA - see k8s/overlay-registry) instead of reusing one.
+resources:
+  - ../base
+
+images:
+  - name: tenantbooks
+    newName: localhost:5000/tenantbooks
+    newTag: v15.103.0
+  - name: tenantbooks-mock-receiver
+    newName: localhost:5000/tenantbooks-mock-receiver
+    newTag: v15.103.0
+
+# Second reason this overlay exists: the laptop has no DNS for
+# tenantbooks.localhost, so the pods need an /etc/hosts entry to fetch their own
+# public URL (PDF rendering).  On a real cluster with a real domain, delete this
+# patch - DNS already does it.
+patches:
+  - path: host-aliases.yaml
+    target:
+      kind: Deployment
+      labelSelector: tier=frappe

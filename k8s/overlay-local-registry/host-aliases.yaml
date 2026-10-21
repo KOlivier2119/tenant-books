@@ -1,0 +1,33 @@
+# Laptop-only: make the site's public hostname resolvable *inside* the cluster.
+#
+# host_name is http://tenantbooks.localhost (the Ingress rule).  On the internet
+# that name resolves to the load balancer because DNS says so; `.localhost` is not
+# DNS, so a worker pod that fetches its own print URL gets
+# "HostNotFoundError" and the PDF job dies.  hostAliases writes the equivalent of
+# the /etc/hosts line that docker-compose got for free from its network alias.
+#
+# Point it at the Ingress controller's ClusterIP, NOT at the address a browser
+# uses:
+#   kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'
+#
+# Measured on k3s, from a frappe pod, same Host header:
+#   http://10.43.178.99/          -> 200   (the Traefik Service VIP)
+#   http://192.168.1.157/         -> 000   (the LoadBalancer address)
+# The VIP reaches the Traefik pod, which is what `frappe-to-ingress` allows by
+# podSelector.  The LB address is a hostPort hop into the svclb pod, whose IP no
+# rule for `app.kubernetes.io/name=traefik` matches, so default-deny egress drops
+# it.  Worth knowing before you "fix" the policy by widening it.
+#
+# Applied to every pod with tier=frappe.  The frontend does not need it: nginx
+# only proxies, it never fetches the site URL itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ignored-targeted-by-label
+spec:
+  template:
+    spec:
+      hostAliases:
+        - ip: 10.43.178.99
+          hostnames:
+            - tenantbooks.localhost
