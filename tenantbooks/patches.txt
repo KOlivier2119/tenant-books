@@ -1,0 +1,2 @@
+# patches are listed one per line as "module.function"
+# example: tenantbooks.patches.version_0_0_2.add_status_field

@@ -1,0 +1,31 @@
+# Anything listed here is invisible to `docker build`, including the read-only
+# mount the builder stage uses to clone the app, so the app package,
+# pyproject.toml and .git MUST stay in the context.
+
+# --- never let local state or secrets into a layer ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- python / node / tooling junk ---
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.ruff_cache/
+**/node_modules/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# --- editor / agent scratch ---
+.idea/
+.vscode/
+.qoder/
+*.swp
+
+# --- docs and demo assets are not needed to build the app ---
+docs/
+*.md

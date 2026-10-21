@@ -1,0 +1,78 @@
+{
+ "actions": [],
+ "autoname": "field:customer_name",
+ "creation": "2026-01-05 09:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "customer_name",
+  "email",
+  "phone",
+  "credit_limit"
+ ],
+ "fields": [
+  {
+   "fieldname": "customer_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Customer Name",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "email",
+   "fieldtype": "Data",
+   "label": "Email",
+   "options": "Email"
+  },
+  {
+   "fieldname": "phone",
+   "fieldtype": "Data",
+   "label": "Phone"
+  },
+  {
+   "default": "0",
+   "description": "0 means no limit. Enforced in code, not by the database.",
+   "fieldname": "credit_limit",
+   "fieldtype": "Currency",
+   "label": "Credit Limit"
+  }
+ ],
+ "links": [],
+ "modified": "2026-01-05 09:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Billing",
+ "name": "Customer Account",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Billing Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Billing Clerk",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "search_fields": "customer_name,email",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 1
+}

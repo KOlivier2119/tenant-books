@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1
+#
+# TenantBooks image = Frappe v15 + the tenantbooks app, built the way
+# frappe_docker builds its own images (docs/02-setup/02-build-setup.md).
+#
+#   stage 1 "builder"  frappe/build  toolchain only: git, gcc, node/yarn, bench
+#   stage 2 "backend"  frappe/base   runtime only: nginx, wkhtmltopdf, node,
+#                                    mariadb client - no compilers, no bench source
+#
+# The builder produces a complete bench directory; the runtime stage receives
+# nothing but that directory.  Build tools therefore cannot be used by anybody
+# who exec's into a running pod.
+#
+# Build from the repository root:
+#
+#   docker buildx build \
+#     --secret id=apps_json,src=apps.json \
+#     --tag tenantbooks:v15.103.0 \
+#     --file docker/custom/Containerfile .
+#
+# apps.json is passed as a BuildKit secret, never a build arg: build args are
+# recorded in `docker image history` forever, a secret mount only exists while
+# the RUN command runs.  That is what lets you put a
+# https://<token>@github.com/... URL here in production without leaking it.
+
+# Same Frappe patch version the Part 1 dev stack runs (frappe/erpnext:v15.101.2
+# ships frappe 15.103.0), so both images produce an identical database schema.
+# Pinned by tag AND digest in docs/part2-docker.md; nothing here uses :latest.
+ARG FRAPPE_REPO=frappe
+ARG FRAPPE_VERSION=v15.103.0
+
+# --------------------------------------------------------------------------
+# stage 1: build the bench
+# --------------------------------------------------------------------------
+FROM ${FRAPPE_REPO}/build:${FRAPPE_VERSION} AS builder
+
+ARG FRAPPE_VERSION
+
+# Never build as root: frappe/build already has an unprivileged "frappe"
+# (uid 1000) user and everything below is written by it.
+USER frappe
+
+RUN --mount=type=secret,id=apps_json,target=/opt/frappe/apps.json,uid=1000,gid=1000 \
+    --mount=type=bind,source=.,target=/opt/src/tenantbooks,readonly \
+    bench init \
+        --apps_path=/opt/frappe/apps.json \
+        --frappe-branch=${FRAPPE_VERSION} \
+        --frappe-path=https://github.com/frappe/frappe \
+        --no-procfile \
+        --no-backups \
+        --skip-redis-config-generation \
+        /home/frappe/frappe-bench \
+    && cd /home/frappe/frappe-bench \
+    # The real common_site_config.json is written once per environment by the
+    # create-site job (it contains that environment's DB host).  The image only
+    # needs the file to exist so that `bench` does not fail before then.
+    && echo '{}' > sites/common_site_config.json \
+    # apps.txt is the list `bench new-site --install-app` reads; rebuild it from
+    # what actually landed in apps/ (lesson learned in Part 1).
+    && ls -1 apps > sites/apps.txt \
+    # Drop git history: it is build-time input, not runtime content, and it
+    # would only add size plus whatever the clone carried.
+    && find apps -mindepth 1 -path '*/.git' -exec rm -rf {} + \
+    # Group-writable + gid 0 so Kubernetes can run the container as any
+    # arbitrary uid as long as it belongs to group 0 (OpenShift convention).
+    && chmod -R g=u /home/frappe/frappe-bench
+
+# --------------------------------------------------------------------------
+# stage 2: runtime
+# --------------------------------------------------------------------------
+FROM ${FRAPPE_REPO}/base:${FRAPPE_VERSION} AS backend
+
+ARG FRAPPE_VERSION
+ARG APP_VERSION=0.0.1
+
+LABEL org.opencontainers.image.title="tenantbooks" \
+      org.opencontainers.image.description="Multi-tenant order and invoicing platform on Frappe" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.base.name="${FRAPPE_REPO}/base:${FRAPPE_VERSION}"
+
+COPY --from=builder --chown=frappe:0 /home/frappe/frappe-bench /home/frappe/frappe-bench
+
+WORKDIR /home/frappe/frappe-bench
+
+# sites/ holds site directories, apps.txt and the built assets; logs/ holds
+# bench and worker logs.  Both are mounted over at runtime (a named volume in
+# compose, a ReadWriteOnce/ReadWriteMany PVC in Kubernetes).
+VOLUME ["/home/frappe/frappe-bench/sites", "/home/frappe/frappe-bench/logs"]
+
+# Tunables for the web process.  Part 7 (Nginx/Gunicorn notes) explains why
+# these numbers and not others; they are plain env vars so a Deployment can
+# change them without rebuilding the image.
+ENV GUNICORN_BIND=0.0.0.0:8000 \
+    GUNICORN_WORKERS=4 \
+    GUNICORN_THREADS=4 \
+    GUNICORN_TIMEOUT=120 \
+    GUNICORN_MAX_REQUESTS=5000 \
+    GUNICORN_MAX_REQUEST_JITTER=50
+
+COPY docker/custom/start.sh /usr/local/bin/start.sh
+RUN chmod 755 /usr/local/bin/start.sh
+
+# frappe/base defaults to root and to `python3`; both are replaced here.
+USER frappe
+EXPOSE 8000
+
+# start.sh exec()s gunicorn, so gunicorn is PID 1 and receives SIGTERM
+# directly - that is what makes a Kubernetes rolling update graceful.
+CMD ["/usr/local/bin/start.sh"]

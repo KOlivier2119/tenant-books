@@ -1,0 +1,26 @@
+[project]
+name = "tenantbooks"
+version = "0.0.1"
+description = "Multi-tenant order and invoicing platform built on Frappe"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["poetry-core>=1.5.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "tenantbooks"
+version = "0.0.1"
+description = "Multi-tenant order and invoicing platform built on Frappe"
+authors = ["TenantBooks Demo <dev@example.com>"]
+license = "MIT"
+packages = [{ include = "tenantbooks" }]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]

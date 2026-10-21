@@ -1,0 +1,201 @@
+# Local development stack for the tenantbooks Frappe app.
+#
+# Based on frappe_docker's official pwd.yml, pinned to Frappe/ERPNext v15 and
+# with the app source bind-mounted so edits on the host are picked up by the
+# backend, workers and scheduler without rebuilding an image.
+#
+#   docker compose -f docker/compose.local.yaml up -d db redis-cache redis-queue
+#   docker compose -f docker/compose.local.yaml run --rm setup
+#   docker compose -f docker/compose.local.yaml up -d
+#   open http://localhost:8080  (login Administrator / admin)
+#
+# Images are pinned by version tag; nothing here uses :latest.
+
+# Shared environment for every Frappe process.  A service that needs extra
+# variables merges this map instead of replacing it (YAML `<<` does not deep
+# merge, so repeating `environment:` would silently drop PYTHONPATH).
+x-frappe-env: &frappe_env
+  DB_HOST: db
+  DB_PORT: "3306"
+  REDIS_CACHE: redis-cache:6379
+  REDIS_QUEUE: redis-queue:6379
+  SOCKETIO_PORT: "9000"
+  # Dev-only trick: make `import tenantbooks` resolve to the bind-mounted
+  # source instead of pip-installing into each container's venv (which is
+  # recreated on every restart).  Production images bake the app in - see
+  # docker/Dockerfile.
+  PYTHONPATH: /home/frappe/frappe-bench/apps/tenantbooks
+
+x-frappe-image: &frappe_image
+  image: frappe/erpnext:v15.101.2
+  networks: [frappe]
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+    # The repo root *is* the app repo (pyproject.toml + tenantbooks/ package),
+    # so it is mounted as the bench app directory.
+    - ../:/home/frappe/frappe-bench/apps/tenantbooks
+  environment: *frappe_env
+
+services:
+  db:
+    image: mariadb:11.4
+    networks: [frappe]
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+    environment:
+      MARIADB_ROOT_PASSWORD: admin
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis-cache:
+    image: redis:6.2-alpine
+    networks: [frappe]
+    command: ["redis-server", "--maxmemory-policy", "allkeys-lru"]
+
+  redis-queue:
+    image: redis:6.2-alpine
+    networks: [frappe]
+    volumes:
+      - redis-queue-data:/data
+
+  # One-time: write common_site_config.json and create the site + app install.
+  setup:
+    <<: *frappe_image
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+    command:
+      - |
+        set -euo pipefail
+        cd /home/frappe/frappe-bench
+
+        # apps.txt tells bench which app directories exist on disk.
+        ls -1 apps > sites/apps.txt
+        bench set-config -g db_host $$DB_HOST
+        bench set-config -gp db_port $$DB_PORT
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE"
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE"
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE"
+        bench set-config -gp socketio_port $$SOCKETIO_PORT
+
+        if [ ! -d sites/tenantbooks.localhost ]; then
+          bench new-site \
+            --db-root-username root \
+            --db-root-password admin \
+            --admin-password admin \
+            --mariadb-user-host-login-scope='%' \
+            --install-app tenantbooks \
+            --set-default \
+            tenantbooks.localhost
+        fi
+
+        bench --site tenantbooks.localhost set-config -g webhook_url http://mock-receiver:8071/hook
+        bench --site tenantbooks.localhost set-config -g webhook_secret demo-secret
+        bench --site tenantbooks.localhost set-config -g allow_tests true
+        bench --site tenantbooks.localhost set-config host_name tenantbooks.localhost
+        bench --site tenantbooks.localhost set-config webserver_port 8080
+        bench --site tenantbooks.localhost migrate
+
+  backend:
+    <<: *frappe_image
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    # no command: the image default is the gunicorn app server
+    environment:
+      <<: *frappe_env
+      GUNICORN_WORKERS: "2"
+      GUNICORN_THREADS: "4"
+      GUNICORN_TIMEOUT: "120"
+
+  frontend:
+    <<: *frappe_image
+    depends_on:
+      - backend
+      - websocket
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      <<: *frappe_env
+      BACKEND: backend:8000
+      FRAPPE_SITE_NAME_HEADER: tenantbooks.localhost
+      SOCKETIO: websocket:9000
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: "120"
+      CLIENT_MAX_BODY_SIZE: 50m
+    ports:
+      - "8080:8080"
+    networks:
+      frappe:
+        # Inside the compose network the site name resolves to the nginx box, so
+        # background workers (and wkhtmltopdf) can fetch /assets/* while building
+        # a PDF.  On your laptop add "127.0.0.1 tenantbooks.localhost" to
+        # /etc/hosts if you want to browse the site by name.
+        aliases: [tenantbooks.localhost]
+
+  websocket:
+    <<: *frappe_image
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+
+  scheduler:
+    <<: *frappe_image
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    command: ["bench", "schedule"]
+
+  worker-short:
+    <<: *frappe_image
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    command: ["bench", "worker", "--queue", "short,default"]
+
+  worker-long:
+    <<: *frappe_image
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    command: ["bench", "worker", "--queue", "long"]
+
+  mock-receiver:
+    image: python:3.12-slim
+    networks: [frappe]
+    working_dir: /app
+    volumes:
+      - ../mock-receiver:/app
+    command: ["python", "receiver.py"]
+    environment:
+      WEBHOOK_SECRET: demo-secret
+      PORT: "8071"
+    ports:
+      - "8071:8071"
+
+volumes:
+  db-data:
+  redis-queue-data:
+  sites:
+  logs:
+
+networks:
+  frappe:
+    driver: bridge

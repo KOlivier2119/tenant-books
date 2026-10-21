@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.env
+node_modules/
+.pytest_cache/
+.ruff_cache/
+volumes/
+sites_backup/
+.qoder/
